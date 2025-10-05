@@ -1554,7 +1554,7 @@ void monitor_modem_status(sys_st *sys)
 	// ---- create FIFO with a few frames of cushion (e.g., 8–12) ----
 	rf10_fifo_t txq;
 	//rf10_fifo_init(&txq, /*cap=*/32, /*drop_oldest_on_full=*/true);
-	rf10_fifo_init(&txq, /*cap=*/32, /*drop_oldest_on_full=*/false);
+	rf10_fifo_init(&txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
     // ---- fill tx_ctrl, once ----
 	tx_ctrl.active        = true;
 	tx_ctrl.radio         = radio;
@@ -1654,7 +1654,7 @@ void monitor_modem_status(sys_st *sys)
 		move(2,0);
 		printw("Modem Status Registers:");
 		move(3,0);
-		refresh();
+		//refresh();
 
 		{
 			uint8_t data[3] = {0};
