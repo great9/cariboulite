@@ -5,7 +5,9 @@
 #define ZF_LOG_TAG "CARIBOU_SMI"
 #include "zf_log/zf_log.h"
 
-#define _GNU_SOURCE
+// #ifndef _GNU_SOURCE
+//     #define _GNU_SOURCE
+// #endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +33,7 @@
 #include <sys/types.h>
 
 #ifndef CARIBOU_SMI_BYTES_PER_SAMPLE
-#define CARIBOU_SMI_BYTES_PER_SAMPLE  (sizeof(caribou_smi_sample_complex_int16))
+    #define CARIBOU_SMI_BYTES_PER_SAMPLE  (sizeof(caribou_smi_sample_complex_int16))
 #endif
 
 
@@ -807,9 +809,9 @@ void print_binairy32(uint32_t value) {
     putchar('\n');
 }
 //=========================================================================
-static void caribou_smi_generate_data(caribou_smi_st* dev, uint8_t* data, size_t data_length, caribou_smi_sample_complex_int16* sample_offset)
+static void caribou_smi_generate_data(caribou_smi_st* dev, uint8_t* data, size_t data_length, const caribou_smi_sample_complex_int16* sample_offset)
 {
-    caribou_smi_sample_complex_int16* cmplx_vec = sample_offset;  
+    const caribou_smi_sample_complex_int16* cmplx_vec = sample_offset;  
     uint32_t *samples = (uint32_t*)(data);
     
     // Sample Structure
