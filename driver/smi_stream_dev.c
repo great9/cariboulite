@@ -956,29 +956,29 @@ static void stream_smi_write_dma_callback(void *param)
 }
 
 /***************************************************************************/
-static void stream_smi_check_and_restart(struct bcm2835_smi_dev_instance *inst)
-{
-    struct bcm2835_smi_instance *smi_inst = inst->smi_inst;
-    inst->count_since_refresh++;
-    if( (inst->count_since_refresh )>= SMI_TRANSFER_MULTIPLIER)
-    {
-        int i;
-        for(i = 0; i < 1000; i++)
-        {
-            if(!smi_is_active(smi_inst))
-            {
-                break;
-            }
-            udelay(1);
-        }
-        if(i == 1000)
-        {
-            print_smil_registers_ext("write dma callback error 1000");
-        }
+// static void stream_smi_check_and_restart(struct bcm2835_smi_dev_instance *inst)
+// {
+//     struct bcm2835_smi_instance *smi_inst = inst->smi_inst;
+//     inst->count_since_refresh++;
+//     if( (inst->count_since_refresh )>= SMI_TRANSFER_MULTIPLIER)
+//     {
+//         int i;
+//         for(i = 0; i < 1000; i++)
+//         {
+//             if(!smi_is_active(smi_inst))
+//             {
+//                 break;
+//             }
+//             udelay(1);
+//         }
+//         if(i == 1000)
+//         {
+//             print_smil_registers_ext("write dma callback error 1000");
+//         }
         
-        smi_refresh_dma_command(smi_inst, DMA_BOUNCE_BUFFER_SIZE/4);
-    }
-}
+//         smi_refresh_dma_command(smi_inst, DMA_BOUNCE_BUFFER_SIZE/4);
+//     }
+// }
 
 /***************************************************************************/
 // static void stream_smi_write_dma_callback(void *param)
