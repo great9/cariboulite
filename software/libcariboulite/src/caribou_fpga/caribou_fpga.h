@@ -166,7 +166,7 @@ int caribou_fpga_hard_reset_keep(caribou_fpga_st* dev, bool reset);
 // programming
 int caribou_fpga_get_status(caribou_fpga_st* dev, caribou_fpga_status_en *stat);
 int caribou_fpga_program_to_fpga(caribou_fpga_st* dev, unsigned char *buffer, size_t len, bool force_prog);
-int caribou_fpga_program_to_fpga_from_file(caribou_fpga_st* dev, char *filename, bool force_prog);
+int caribou_fpga_program_to_fpga_from_file(caribou_fpga_st* dev, const char *filename, bool force_prog);
 
 // System Controller
 int caribou_fpga_get_versions (caribou_fpga_st* dev, caribou_fpga_versions_st *vers);

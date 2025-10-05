@@ -213,7 +213,7 @@ int caribou_fpga_program_to_fpga(caribou_fpga_st* dev, unsigned char *buffer, si
 }
 
 //--------------------------------------------------------------
-int caribou_fpga_program_to_fpga_from_file(caribou_fpga_st* dev, char *filename, bool force_prog)
+int caribou_fpga_program_to_fpga_from_file(caribou_fpga_st* dev, const char *filename, bool force_prog)
 {
 	caribou_fpga_get_status(dev, NULL);
 	if (dev->status == caribou_fpga_status_not_programmed || force_prog)
