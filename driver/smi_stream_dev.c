@@ -935,13 +935,27 @@ static void stream_smi_write_dma_callback(void *param)
     cur  = base + q * (inst->current_read_chunk & 3);
     prev = base + q * ((inst->current_read_chunk + 3) & 3);
 
+    // if (kfifo_len(&inst->tx_fifo) >= q) {
+    //     (void)kfifo_out(&inst->tx_fifo, cur, q);
+    // } else {
+    //     /* Producer starved -> repeat previous quarter (or memset to carrier) */
+    //     memcpy(cur, prev, q);
+    //     inst->counter_missed++;
+    // }
+
     if (kfifo_len(&inst->tx_fifo) >= q) {
-        (void)kfifo_out(&inst->tx_fifo, cur, q);
+    unsigned int copied = kfifo_out(&inst->tx_fifo, cur, q);
+    if (copied != q) {
+        /* producer underrun: pad the remainder (reuse previous or zero) */
+        memcpy(cur + copied, prev + copied, q - copied);
+        inst->counter_missed++;
+    }
     } else {
-        /* Producer starved -> repeat previous quarter (or memset to carrier) */
+        /* not enough data: repeat previous quarter (or memset to carrier) */
         memcpy(cur, prev, q);
         inst->counter_missed++;
     }
+
     inst->current_read_chunk++;
 
     if (!(inst->current_read_chunk % 111)) {
@@ -1160,15 +1174,33 @@ int transfer_thread_init(struct bcm2835_smi_dev_instance *inst,
     if (errors) return -2;
 
     /* If TX, prefill the 4 periods so DMA has data immediately */
+    // if (dir == DMA_MEM_TO_DEV) {
+    //     uint8_t *base = (uint8_t *)inst->smi_inst->bounce.buffer[0];
+    //     const size_t q = DMA_BOUNCE_BUFFER_SIZE / 4;
+    //     int i;
+    //     for (i = 0; i < 4; i++) {
+    //         if (kfifo_len(&inst->tx_fifo) >= q) {
+    //             (void)kfifo_out(&inst->tx_fifo, base + i * q, q);
+    //         } else {
+    //             memset(base + i * q, 0, q);  /* steady I/Q if underrun at start */
+    //         }
+    //     }
+    // }
+
+    /* If TX, prefill the 4 periods so DMA has data immediately */
     if (dir == DMA_MEM_TO_DEV) {
         uint8_t *base = (uint8_t *)inst->smi_inst->bounce.buffer[0];
         const size_t q = DMA_BOUNCE_BUFFER_SIZE / 4;
-        int i;
-        for (i = 0; i < 4; i++) {
+
+        for (int i = 0; i < 4; i++) {
             if (kfifo_len(&inst->tx_fifo) >= q) {
-                (void)kfifo_out(&inst->tx_fifo, base + i * q, q);
+                unsigned int copied = kfifo_out(&inst->tx_fifo, base + i * q, q);
+                if (copied != q) {
+                    memset(base + i * q + copied, 0, q - copied);
+                    inst->counter_missed++;
+                }
             } else {
-                memset(base + i * q, 0, q);  /* steady I/Q if underrun at start */
+                memset(base + i * q, 0, q); /* steady I/Q at start */
             }
         }
     }
