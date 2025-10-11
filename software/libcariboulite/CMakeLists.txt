@@ -34,13 +34,13 @@ set(TARGET_LINK_LIBS    datatypes
                         io_utils
                         zf_log
                         rt
-                        m
-                        pthread)
+                        m)
 
 set(SOURCES_CPP_LIB src/CaribouLiteCpp.cpp src/CaribouLiteRadioCpp.cpp)
 
 # Enable POSIX/GNU extensions so siginfo_t and SA_SIGINFO are visible
-add_definitions(-D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE)
+add_definitions(-D_POSIX_C_SOURCE=200809L)
+add_compile_definitions(_GNU_SOURCE)
 
 # Add internal project dependencies
 add_subdirectory(src/datatypes EXCLUDE_FROM_ALL)
@@ -67,17 +67,23 @@ set_target_properties(cariboulite_shared PROPERTIES PUBLIC_HEADER "src/caribouli
 set_property(TARGET cariboulite_shared PROPERTY POSITION_INDEPENDENT_CODE 1)
 set_target_properties(cariboulite_shared PROPERTIES OUTPUT_NAME cariboulite)
 
-find_package(Threads REQUIRED)
 
 #--------------------------------------
-# added to support pthread scheduling
+# add pthread scheduling support
 #--------------------------------------
-add_compile_definitions(_GNU_SOURCE)
+find_package(Threads REQUIRED)
 
 #--------------------------------------
 # add ncurses support
 #--------------------------------------
 find_package(Curses REQUIRED)
+
+#--------------------------------------
+# add ALSA support
+#--------------------------------------
+find_package(ALSA REQUIRED)
+#include_directories(${PROJECT_SOURCE_DIR}/include)
+
 include_directories(${CURSES_INCLUDE_DIR})
 
 #--------------------------------------
@@ -89,11 +95,7 @@ if (NOT SoapySDR_FOUND)
     return()
 endif ()
 
-#--------------------------------------
-# add ALSA support
-#--------------------------------------
-find_package(ALSA REQUIRED)
-include_directories(${PROJECT_SOURCE_DIR}/include)
+
 
 if(CMAKE_COMPILER_IS_GNUCXX)
     include(CheckCXXCompilerFlag)
