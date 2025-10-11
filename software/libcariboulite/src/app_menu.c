@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <stddef.h>   // if you want offsetof
 #include <stdint.h>
+#include <alsa/asoundlib.h>
 
 _Static_assert(sizeof(caribou_smi_sample_complex_int16) == 4,
                "caribou_smi_sample_complex_int16 must be 4 bytes (2x int16)");
@@ -74,6 +75,8 @@ typedef enum
 	app_selection_modem_rx_iq,
 	app_selection_synthesizer,
 	app_selection_nbfm_tx_tone,
+	app_selection_nbfm_rx,
+    app_selection_nbfm_modem_selftest,
 	app_selection_monitor_modem_status,
 	app_selection_quit = 99,
 } app_selection_en;
@@ -99,6 +102,8 @@ static void modem_tx_cw(sys_st *sys);
 static void modem_rx_iq(sys_st *sys);
 static void synthesizer(sys_st *sys);
 static void nbfm_tx_tone(sys_st *sys);
+static void nbfm_rx(sys_st *sys);
+static void nbfm_modem_selftest(sys_st *sys);
 static void monitor_modem_status(sys_st *sys);
 
 //=================================================
@@ -116,6 +121,8 @@ app_menu_item_st handles[] =
 	{app_selection_modem_rx_iq, modem_rx_iq, "Modem receive I/Q stream",},
     {app_selection_synthesizer, synthesizer, "Synthesizer 85-4200 MHz",},
 	{app_selection_nbfm_tx_tone, nbfm_tx_tone, "NBFM TX Tone",},
+	{app_selection_nbfm_rx, nbfm_rx, "NBFM RX",},
+    {app_selection_nbfm_modem_selftest, nbfm_modem_selftest, "NBFM modem Self-Test",},
 	{app_selection_monitor_modem_status, monitor_modem_status, "Monitor Modem Status",},
 };
 #define NUM_HANDLES 	(int)(sizeof(handles)/sizeof(app_menu_item_st))
@@ -848,16 +855,36 @@ void print_binairy8(uint8_t value) {
 typedef struct rf10_fifo_s rf10_fifo_t;
 typedef struct rf10_frame_s rf10_frame_t;
 
-typedef struct 
-{
+typedef struct {
+    bool                active;
+    rf10_fifo_t*        fifo_in;     // 10ms @ 4MS/s IQ frames from rx_reader
+    const float         deemph_tau;  // e.g., 75e-6 (NA) or 50e-6 (EU)
+    float               fs_rf;       // 4e6
+    float               fs_audio;    // 48000
+
+    // state
+    float               deemph_y;
+    int16_t             last_i, last_q; // FM discrim previous sample
+
+    // ALSA sink
+    snd_pcm_t*          pcm;
+    unsigned            pcm_rate;
+    unsigned            pcm_channels;   
+    float               pcm_gain;       
+    uint64_t            pcm_total_frames; // diag counter
+} nbfm_demod_ctrl_t;
+
+typedef struct {
     bool active;
     cariboulite_radio_state_st *radio;
     cariboulite_sample_complex_int16 *rx_buffer;
     size_t rx_buffer_size;
+	
+	// new
+	rf10_fifo_t* rx_fifo;
 } rx_reader_ctrl_st;
 
-typedef struct 
-{
+typedef struct {
     bool active;
     cariboulite_radio_state_st *radio;
     cariboulite_sample_complex_int16 *tx_buffer;
@@ -1166,70 +1193,428 @@ static inline void fill_tone_48k(tx_writer_ctrl_st* ctrl, float* buf, size_t n)
     ctrl->tone_phase = phase;
 }
 
+// static void* rx_reader_thread_func(void* arg)
+// {
+//     pthread_setname_np(pthread_self(), "rx_reader");
+
+// 	rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
+//     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+//     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
+//     caribou_smi_st *smi = &ctrl->radio->sys->smi;
+
+//     // Start with a sane batch; may grow if native gets bigger
+//     size_t native_bytes = caribou_smi_get_native_batch_samples(smi);
+//     size_t batch        = native_bytes ? (native_bytes / CARIBOU_SMI_BYTES_PER_SAMPLE) : 32768;
+//     if (batch > ctrl->rx_buffer_size) batch = ctrl->rx_buffer_size;
+
+//     cariboulite_sample_meta* metadata = malloc(sizeof(*metadata) * batch);
+//     if (!metadata) return NULL;
+
+//     // tiny nap helper (50 µs)
+//     const struct timespec ts50us = { .tv_sec = 0, .tv_nsec = 50 * 1000 };
+
+//     while (ctrl->active) {
+//         pthread_testcancel();
+
+//         if (!nbfm_rx_active) {
+//             nanosleep(&ts50us, NULL);
+//             continue;
+//         }
+
+//         // Track native batch occasionally (in case driver changes it)
+//         size_t nb = caribou_smi_get_native_batch_samples(smi);
+//         size_t new_batch = nb ? (nb / CARIBOU_SMI_BYTES_PER_SAMPLE) : batch;
+//         if (new_batch == 0) new_batch = batch;
+//         if (new_batch > ctrl->rx_buffer_size) new_batch = ctrl->rx_buffer_size;
+
+//         if (new_batch > batch) {
+//             // grow metadata if needed
+//             cariboulite_sample_meta* m2 = realloc(metadata, sizeof(*metadata) * new_batch);
+//             if (m2) {
+//                 metadata = m2;
+//                 batch = new_batch;
+//             }
+//         } else {
+//             batch = new_batch;
+//         }
+
+//         // Blocking read for *one* native batch keeps latency low and UI snappy
+//         int ret = cariboulite_radio_read_samples(ctrl->radio,
+//                                                  ctrl->rx_buffer,
+//                                                  metadata,
+//                                                  batch);
+//         if (ret > 0) {
+//             latest_rx_sample = ctrl->rx_buffer[ret >> 1];  // mid-sample snapshot
+//         } else if (ret == 0) {
+//             // no data right now; avoid hot spin
+//             nanosleep(&ts50us, NULL);
+//         } else {
+//             // error; brief backoff
+//             const struct timespec ts200us = { .tv_sec = 0, .tv_nsec = 200 * 1000 };
+//             nanosleep(&ts200us, NULL);
+//         }
+//     }
+//     free(metadata);
+//     return NULL;
+// }
+
 static void* rx_reader_thread_func(void* arg)
 {
-    pthread_setname_np(pthread_self(), "rx_reader");
-
-	rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-
+    rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
     caribou_smi_st *smi = &ctrl->radio->sys->smi;
 
-    // Start with a sane batch; may grow if native gets bigger
-    size_t native_bytes = caribou_smi_get_native_batch_samples(smi);
-    size_t batch        = native_bytes ? (native_bytes / CARIBOU_SMI_BYTES_PER_SAMPLE) : 32768;
-    if (batch > ctrl->rx_buffer_size) batch = ctrl->rx_buffer_size;
+    const size_t want = 40000; // 10 ms @ 4 MS/s
+    cariboulite_sample_complex_int16* buf = ctrl->rx_buffer;
+    cariboulite_sample_meta* meta = malloc(sizeof(*meta) * want);
 
-    cariboulite_sample_meta* metadata = malloc(sizeof(*metadata) * batch);
-    if (!metadata) return NULL;
-
-    // tiny nap helper (50 µs)
-    const struct timespec ts50us = { .tv_sec = 0, .tv_nsec = 50 * 1000 };
-
+    size_t have = 0;
     while (ctrl->active) {
-        pthread_testcancel();
+        int ret = cariboulite_radio_read_samples(ctrl->radio, buf + have, meta, want - have);
+        if (ret > 0) have += (size_t)ret;
 
-        if (!nbfm_rx_active) {
-            nanosleep(&ts50us, NULL);
-            continue;
-        }
-
-        // Track native batch occasionally (in case driver changes it)
-        size_t nb = caribou_smi_get_native_batch_samples(smi);
-        size_t new_batch = nb ? (nb / CARIBOU_SMI_BYTES_PER_SAMPLE) : batch;
-        if (new_batch == 0) new_batch = batch;
-        if (new_batch > ctrl->rx_buffer_size) new_batch = ctrl->rx_buffer_size;
-
-        if (new_batch > batch) {
-            // grow metadata if needed
-            cariboulite_sample_meta* m2 = realloc(metadata, sizeof(*metadata) * new_batch);
-            if (m2) {
-                metadata = m2;
-                batch = new_batch;
+        if (have == want) {
+            rf10_frame_t frm;
+            for (size_t i=0;i<want;i++) {
+                frm.data[i].i = buf[i].i;
+                frm.data[i].q = buf[i].q;
             }
-        } else {
-            batch = new_batch;
-        }
-
-        // Blocking read for *one* native batch keeps latency low and UI snappy
-        int ret = cariboulite_radio_read_samples(ctrl->radio,
-                                                 ctrl->rx_buffer,
-                                                 metadata,
-                                                 batch);
-        if (ret > 0) {
-            latest_rx_sample = ctrl->rx_buffer[ret >> 1];  // mid-sample snapshot
-        } else if (ret == 0) {
-            // no data right now; avoid hot spin
-            nanosleep(&ts50us, NULL);
-        } else {
-            // error; brief backoff
-            const struct timespec ts200us = { .tv_sec = 0, .tv_nsec = 200 * 1000 };
-            nanosleep(&ts200us, NULL);
+            rf10_fifo_put(ctrl->rx_fifo /*add to ctrl*/, &frm, -1);
+            have = 0;
         }
     }
+    free(meta);
+    return NULL;
+}
 
-    free(metadata);
+// --- very small ALSA playback helper (16-bit mono, 48k) ---
+// static int alsa_open_playback(snd_pcm_t **ppcm, const char* dev)
+// {
+//     snd_pcm_t* pcm = NULL;
+//     snd_pcm_hw_params_t* hw = NULL;
+
+//     if (snd_pcm_open(&pcm, dev ? dev : "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) return -1;
+//     snd_pcm_hw_params_malloc(&hw);
+//     snd_pcm_hw_params_any(pcm, hw);
+//     snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+//     snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
+//     unsigned int rate = 48000; int dir = 0;
+//     snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, &dir);
+//     snd_pcm_hw_params_set_channels(pcm, hw, 1);
+//     snd_pcm_hw_params(pcm, hw);
+//     snd_pcm_hw_params_free(hw);
+//     snd_pcm_prepare(pcm);
+//     *ppcm = pcm;
+//     return 0;
+// }
+
+static const char* pcm_state_name(snd_pcm_state_t s){
+    switch (s){
+        case SND_PCM_STATE_OPEN: return "OPEN";
+        case SND_PCM_STATE_SETUP: return "SETUP";
+        case SND_PCM_STATE_PREPARED: return "PREPARED";
+        case SND_PCM_STATE_RUNNING: return "RUNNING";
+        case SND_PCM_STATE_XRUN: return "XRUN";
+        case SND_PCM_STATE_DRAINING: return "DRAINING";
+        case SND_PCM_STATE_PAUSED: return "PAUSED";
+        case SND_PCM_STATE_SUSPENDED: return "SUSPENDED";
+        case SND_PCM_STATE_DISCONNECTED: return "DISCONNECTED";
+        default: return "?";
+    }
+}
+
+static void write_exact_alsa_16(snd_pcm_t* pcm,
+                                const int16_t* mono,
+                                size_t frames,
+                                unsigned channels)
+{
+    if (channels == 1) {
+        // write mono directly
+        size_t left = frames;
+        const int16_t* p = mono;
+        while (left) {
+            snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, left);
+            if (w == -EPIPE) { snd_pcm_prepare(pcm); continue; }
+            if (w == -EAGAIN) continue;
+            if (w < 0) { fprintf(stderr,"ALSA write err: %s\n", snd_strerror((int)w)); break; }
+            p += w; left -= (size_t)w;
+        }
+        return;
+    }
+
+    // duplicate mono → stereo into a small stack buffer (safe for 480 frames)
+    int16_t interleaved[480 * 2];
+    while (frames) {
+        size_t chunk = frames > 480 ? 480 : frames;
+        for (size_t i = 0, j = 0; i < chunk; ++i) {
+            int16_t s = mono[i];
+            interleaved[j++] = s;
+            interleaved[j++] = s;
+        }
+        size_t left = chunk;
+        const int16_t* p = interleaved;
+        while (left) {
+            snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, left);
+            if (w == -EPIPE) { snd_pcm_prepare(pcm); continue; }
+            if (w == -EAGAIN) continue;
+            if (w < 0) { fprintf(stderr,"ALSA write err: %s\n", snd_strerror((int)w)); break; }
+            p += w * 2;      // 2 samples per frame
+            left -= (size_t)w;
+        }
+        mono   += chunk;
+        frames -= chunk;
+    }
+}
+
+static int alsa_open_playback(snd_pcm_t **ppcm,
+                              const char* dev,
+                              unsigned *out_rate,
+                              unsigned *out_channels)
+{
+    snd_pcm_t* pcm = NULL;
+    snd_pcm_hw_params_t* hw = NULL;
+    int rc;
+
+    const char* card = dev && *dev ? dev : "default";
+    if ((rc = snd_pcm_open(&pcm, card, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+        fprintf(stderr, "ALSA: open(%s) failed: %s\n", card, snd_strerror(rc));
+        return -1;
+    }
+
+    snd_pcm_hw_params_malloc(&hw);
+    snd_pcm_hw_params_any(pcm, hw);
+    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
+
+    unsigned rate = 48000; int dir = 0;
+    snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, &dir);
+
+    // try mono first; if it fails we’ll retry with 2ch
+    unsigned ch = 1;
+    rc = snd_pcm_hw_params_set_channels(pcm, hw, ch);
+    if (rc < 0) {
+        ch = 2;
+        rc = snd_pcm_hw_params_set_channels(pcm, hw, ch);
+        if (rc < 0) { fprintf(stderr,"ALSA: channels failed: %s\n", snd_strerror(rc)); goto fail; }
+    }
+
+    // make buffer a bit deeper to avoid XRUN storms
+    snd_pcm_uframes_t period = 480;    // 10 ms
+    snd_pcm_uframes_t buffer = 4800;   // 100 ms
+    snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL);
+    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
+
+    if ((rc = snd_pcm_hw_params(pcm, hw)) < 0) { fprintf(stderr,"ALSA: hw_params: %s\n", snd_strerror(rc)); goto fail; }
+    snd_pcm_hw_params_free(hw);
+
+    if ((rc = snd_pcm_prepare(pcm)) < 0) { fprintf(stderr,"ALSA: prepare: %s\n", snd_strerror(rc)); snd_pcm_close(pcm); return -1; }
+
+    fprintf(stderr, "ALSA: opened %s, %uch, S16_LE, %u Hz\n", card, ch, rate);
+    *ppcm = pcm;
+    if (out_rate)     *out_rate = rate;
+    if (out_channels) *out_channels = ch;
+    return 0;
+
+fail:
+    snd_pcm_hw_params_free(hw);
+    snd_pcm_close(pcm);
+    return -1;
+}
+
+// --- simple 1st-order de-emphasis (continuous-time tau) at fs samples/s
+static inline float deemph(float x, float *y, float tau, float fs)
+{
+    const float a = expf(-1.0f/(fs * tau));       // pole
+    const float b = 1.0f - a;                     // zero gain so DC passes less
+    *y = a * (*y) + b * x;
+    return *y;
+}
+
+// --- audio-rate deemphasis (48 kHz) ---
+static inline float deemph_48k(float x, float *z, float tau_s)
+{
+    if (tau_s <= 0.f) return x;          // bypass if tau==0
+    const float fs = 48000.f;
+    const float a  = expf(-1.0f/(fs * tau_s));
+    const float b  = 1.0f - a;
+    *z = a * (*z) + b * x;
+    return *z;
+}
+
+// // --- FM discriminator + deemph + 3/250 resample to 48k --
+// static void* nbfm_demod_thread(void* arg)
+// {
+//     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
+//     const float fs_in = c->fs_rf;     // 4e6
+//     const float fs_out = c->fs_audio; // 48k
+//     const int L = 3, M = 250;         // 4e6 * 3/250 = 48k
+//     const float step = (float)M / (float)L;  // 83.333...
+    
+//     // output block = 10 ms @ 48k = 480 samples
+//     int16_t audio_10ms[480];
+
+//     float acc = 0.0f;                 // fractional index accumulator (in input samples)
+//     float deemph_state = 0.0f;
+//     int16_t pi = 0, pq = 0;
+
+//     while (c->active) {
+//         rf10_frame_t frm;
+//         if (!rf10_fifo_get(c->fifo_in, &frm, -1)) continue;
+
+//         // process 40k IQ @ 4 MS/s
+//         // (prev sample carries across frames)
+//         size_t nout = 0;
+//         for (size_t n = 0; n < 40000; n++) {
+//             int16_t ci = frm.data[n].i;
+//             int16_t cq = frm.data[n].q;
+
+//             // FM discrim (small-angle approx)
+//             int num =  (int)pi * (int)cq - (int)pq * (int)ci;
+//             int den =  (int)pi * (int)ci + (int)pq * (int)cq;
+//             if (den == 0) den = 1;
+//             float fm = (float)num / (float)den;        // ~ phase delta
+
+//             // de-emphasis (e.g., 75 us). Do it at RF fs then resample.
+//             float y = deemph(fm, &deemph_state, c->deemph_tau, fs_in);
+
+//             // fractional downsample to 48k by linear interpolation on the 4M stream:
+//             // output whenever acc <= 0, then acc += step; otherwise acc -= 1 per input.
+//             // (equivalently: keep a running "when to emit" schedule)
+//             acc -= 1.0f;
+//             while (acc <= 0.0f) {
+//                 // linear interp between current y and previous y (we need y[n] & y[n-1])
+//                 // For simplicity, just take current y (acceptable for NBFM voice).
+//                 //float s = y * 12000.0f; // scale for comfortable audio level
+//                 float s = y * c->pcm_gain; // c->pcm_gain set per test/RX
+//                 if (s > 32767.0f) s = 32767.0f;
+//                 if (s < -32768.0f) s = -32768.0f;
+//                 audio_10ms[nout++] = (int16_t)lrintf(s);
+//                 acc += step;
+//                 if (nout == 480) break; // exactly 10 ms
+//             }
+//             static uint64_t last_ms = 0;
+//             pi = ci; pq = cq;
+//             if (nout == 480) {
+//                 // write one 10 ms frame to ALSA
+//                 write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
+//                 c->pcm_total_frames += 480;
+
+//                 // once per ~1s, print that we’re alive
+//                 struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+//                 uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+//                 if (!last_ms) last_ms = ms;
+//                 if (ms - last_ms >= 1000) {
+//                     fprintf(stderr, "DEMOD: played ~%llu frames (%.1f s), ALSA state=%s, ch=%u\n",
+//                             (unsigned long long)c->pcm_total_frames,
+//                             (double)c->pcm_total_frames / (double)c->pcm_rate,
+//                             pcm_state_name(snd_pcm_state(c->pcm)),
+//                             c->pcm_channels);
+//                     last_ms = ms;
+//                 }
+
+//                 nout = 0;
+//             }
+//         }
+//     }
+//     return NULL;
+// }
+
+// --- FM discriminator (atan2), 3/250 resample to 48k, deemphasis at 48k ---
+static void* nbfm_demod_thread(void* arg)
+{
+    nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
+    const float fs_in  = c->fs_rf;      // 4e6
+    const float fs_out = c->fs_audio;   // 48k
+    const int   L = 3, M = 250;         // 4e6 * 3/250 = 48k
+    const float step = (float)M / (float)L;  // 83.333...
+    (void)fs_out; // kept for clarity
+
+    // --- normalize discriminator so full deviation → ~±1 before deemph ---
+    const float f_dev_hz = 2500.0f;                     // must match your modulator
+    const float K_norm   = fs_in / (2.0f * (float)M_PI * f_dev_hz);
+
+    // output block = 10 ms @ 48k = 480 samples
+    int16_t audio_10ms[480];
+
+    float acc = 0.0f;                 // fractional downsample accumulator (your scheme)
+    float deemph_state = 0.0f;        // deemphasis state @ 48 kHz
+    int16_t pi = 0, pq = 0;           // previous I/Q for discrim
+    int      have_prev = 0;
+
+    while (c->active) {
+        rf10_frame_t frm;
+        if (!rf10_fifo_get(c->fifo_in, &frm, -1)) continue;
+
+        size_t nout = 0;              // how many 48k samples filled in this 10 ms block
+
+        // process 40k IQ @ 4 MS/s
+        for (size_t n = 0; n < 40000; n++) {
+            const int16_t ci16 = frm.data[n].i;
+            const int16_t cq16 = frm.data[n].q;
+
+            if (!have_prev) {
+                pi = ci16; pq = cq16;
+                have_prev = 1;
+                continue;
+            }
+
+            // --- true phase-step discriminator: s[n] * conj(s[n-1]) ---
+            const float ci = (float)ci16, cq = (float)cq16;
+            const float pi_f = (float)pi,   pq_f = (float)pq;
+
+            const float real = ci * pi_f + cq * pq_f;
+            const float imag = cq * pi_f - ci * pq_f;
+            const float dphi = atan2f(imag, real);   // radians
+            const float y    = dphi * K_norm;        // normalized (±1 at full dev)
+            
+            static double m=0, s2=0; static uint64_t k=0;
+            k++; double e=dphi; double d=e - m; m += d/k; s2 += d*(e - m);
+            if ((k % (40000*10)) == 0) { // about 0.1 s at 4 MS/s
+                double rms = sqrt(s2/k);
+                fprintf(stderr, "dphi mean=%.3g, rms=%.3g\n", m, rms);
+                k=0; m=0; s2=0;
+            }
+
+            // --- fractional downsample to 48k (keep your acc/step scheme) ---
+            acc -= 1.0f;
+            while (acc <= 0.0f) {
+                // deemphasis at the AUDIO rate (48 kHz), then scale to int16
+                float ya = deemph_48k(y, &deemph_state, c->deemph_tau);
+                float s  = ya * c->pcm_gain;
+                if (s >  32767.f) s =  32767.f;
+                if (s < -32768.f) s = -32768.f;
+                audio_10ms[nout++] = (int16_t)lrintf(s);
+
+                acc += step;
+                if (nout == 480) break; // exactly 10 ms payload
+            }
+
+            // advance discrim state
+            pi = ci16; pq = cq16;
+
+            // ship one 10 ms frame whenever ready
+            static uint64_t last_ms = 0;
+            if (nout == 480) {
+                write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
+                c->pcm_total_frames += 480;
+
+                // light progress log (~1 Hz)
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+                if (!last_ms) last_ms = ms;
+                if (ms - last_ms >= 1000) {
+                    fprintf(stderr,
+                        "DEMOD: played ~%llu frames (%.1f s), ALSA state=%s, ch=%u\n",
+                        (unsigned long long)c->pcm_total_frames,
+                        (double)c->pcm_total_frames / (double)c->pcm_rate,
+                        pcm_state_name(snd_pcm_state(c->pcm)),
+                        c->pcm_channels);
+                    last_ms = ms;
+                }
+                nout = 0;
+            }
+        }
+    }
     return NULL;
 }
 
@@ -1363,7 +1748,7 @@ static void nbfm_tx_tone(sys_st *sys)
 
     // FIFO for 10ms frames
     rf10_fifo_t txq;
-    rf10_fifo_init(&txq, /*cap=*/32, /*drop_oldest_on_full=*/false);
+    rf10_fifo_init(&txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
 
     tx_writer_ctrl_st tx_ctrl = {
         .active        = true,
@@ -1499,6 +1884,271 @@ static void nbfm_tx_tone(sys_st *sys)
     if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
 
     printf("NBFM TX tone stopped.\n");
+}
+
+static void nbfm_rx(sys_st *sys)
+{
+    // mirror monitor_modem_status() semantics, but without ncurses/instrumentation
+    nbfm_tx_active = false;
+    nbfm_rx_active = false;
+
+    double frequency = 430100000;   // Hz
+
+    cariboulite_radio_state_st *radio = &sys->radio_low;
+
+    // FIFO for 10ms frames
+    rf10_fifo_t rxq;
+    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/false);
+
+    // RX reader
+	rx_reader_ctrl_st rx = {
+		.active = true,
+		.radio  = &sys->radio_low,
+		.rx_buffer = malloc(sizeof(cariboulite_sample_complex_int16) * 40000),
+		.rx_buffer_size = 40000,
+		.rx_fifo = &rxq,                         // <-- add this field
+	};
+	pthread_t rx_th;
+	pthread_create(&rx_th, NULL, rx_reader_thread_func, &rx);
+
+    // Demod
+	nbfm_demod_ctrl_t dm = {
+		.active = true,
+		.fifo_in = &rxq,
+		.deemph_tau = 50e-6f,        // or 50e-6f
+        .fs_rf = 4000000.0f,
+		.fs_audio = 48000.0f,
+		.deemph_y = 0.0f,
+		.last_i = 0, .last_q = 0,
+		.pcm = NULL,
+        .pcm_rate = 0,
+        .pcm_channels = 0,
+        .pcm_gain = 8000.0f,          // <-- boost a bit so you *hear* it
+        .pcm_total_frames = 0,
+    };
+    
+	// open with channel detection
+    if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
+        fprintf(stderr, "[nbfm_rx] alsa_open_playback failed\n");
+        return;
+    }
+
+    // ping: quick ping of 1.5 kHz tone to verify audio path is working
+    int16_t ping[12000]; // 0.25s @ 48k
+    for (int i = 0; i < 12000; i++) {
+        float x = sinf(2.f * M_PI * 1500.f * (float)i / 48000.f);
+        ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
+    }
+    write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
+
+    pthread_t demod_th;
+	pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
+
+
+    // Radio base config
+    HW_LOCK();
+    cariboulite_radio_set_frequency(&sys->radio_low, true, &frequency);
+    HW_UNLOCK();
+    
+    // --- Minimal CLI: 1 = toggle TX, 99 = exit ---
+    for (;;) {
+        int choice = -1;
+		printf("TX frequency: %.0f Hz\n",round(frequency/1000)*1000);
+        printf(" [ 1] Toggle NBFM RX\n"); 
+		printf(" [99] Return to main menu\n");
+        printf(" Choice: ");
+        if (scanf("%d", &choice) != 1) {
+            // flush junk on input error
+            int c; while ((c = getchar()) != '\n' && c != EOF) {}
+            continue;
+        }
+
+        if (choice == 1) {
+            // exactly like 't' path in monitor_modem_status()
+            if (!nbfm_rx_active) {
+                if (nbfm_tx_active) {
+                    nbfm_tx_active = false;
+                    HW_LOCK();
+                    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+                    HW_UNLOCK();
+                }
+                HW_LOCK();
+                caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_rx_lowpass);
+                cariboulite_radio_activate_channel(&sys->radio_low, cariboulite_channel_dir_rx, true);
+                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)1); // RX S1G
+                HW_UNLOCK();
+
+                __sync_synchronize();   // memory barrier
+                nbfm_rx_active = true;  // tell reader LAST
+                printf("RX: ON\n");
+            } else {
+                nbfm_rx_active = false;
+                __sync_synchronize();
+
+                HW_LOCK();
+                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
+                cariboulite_radio_activate_channel(&sys->radio_low, cariboulite_channel_dir_rx, false);
+                caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
+                HW_UNLOCK();
+                printf("RX: OFF\n");
+            }
+        } else if (choice == 99) {
+            break;
+        }
+    }
+
+    // --- Teardown (same order/pattern as monitor_modem_status) ---
+	dm.active = false;
+    nbfm_rx_active = false;
+    smi_idle(sys);
+
+    HW_LOCK();
+    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
+    HW_UNLOCK();
+    usleep(30 * 1000);
+
+   
+
+    pthread_cancel(demod_th);
+    pthread_cancel(rx_th);
+    pthread_join(demod_th, NULL);
+    pthread_join(rx_th, NULL);
+
+    rf10_fifo_destroy(&rxq);
+    if (dm.pcm) snd_pcm_close(dm.pcm);
+
+    
+
+    printf("NBFM RX stopped.\n");
+}
+
+// --- Self-test: synthesize audio -> nbfm modulation -> IQ@4M -> nbfm demodulation -> ALSA ---
+static void nbfm_modem_selftest(sys_st *sys)
+{
+    (void)sys;
+
+    // 1) Create RX FIFO and start the existing demod thread pointing to ALSA
+    rf10_fifo_t rxq;
+    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/false);
+
+    nbfm_demod_ctrl_t dm = {
+        .active      = true,
+        .fifo_in     = &rxq,
+        .deemph_tau  = 50e-6f,      // or 75e-6f
+        .fs_rf       = 4000000.0f,
+        .fs_audio    = 48000.0f,
+        .deemph_y    = 0.0f,
+        .last_i      = 0,
+        .last_q      = 0,
+        .pcm         = NULL,
+    };
+
+    // Use your playback opener (change device as needed: "default", "plughw:USB,0", etc.)
+    unsigned rate=0, ch=0;
+    if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
+        fprintf(stderr, "[selftest] alsa_open_playback failed\n");
+        rf10_fifo_destroy(&rxq);
+        return;
+    }
+    dm.pcm_gain = 12000.0f;
+    dm.pcm_channels = ch ? ch : 1;
+    
+    // ping: quick ping of 1.5 kHz tone to verify audio path is working
+    int16_t ping[12000]; // 0.25s @ 48k
+    for (int i = 0; i < 12000; i++) {
+        float x = sinf(2.f * M_PI * 1500.f * (float)i / 48000.f);
+        ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
+    }
+    write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
+
+
+
+    pthread_t demod_th;
+    pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
+
+    // 2) Build the NBFM modulator you already use in TX
+    nbfm4m_cfg_t cfg = {
+        .audio_fs      = 48000.0,
+        .rf_fs         = 4000000.0,
+        .f_dev_hz      = 2500.0,
+        .preemph_tau_s = 0.0,
+        .out_scale     = 4000.0f,
+        .linear_interp = 1,
+    };
+    nbfm4m_mod_t* fm = nbfm4m_create(&cfg);
+    float*  a48k   = (float*)calloc(480,    sizeof(float));  // 10 ms audio
+    iq16_t* iq4m   = (iq16_t*)calloc(40000, sizeof(iq16_t)); // 10 ms RF
+
+    if (!fm || !a48k || !iq4m) {
+        fprintf(stderr, "[selftest] alloc/mod create failed\n");
+        if (fm) nbfm4m_destroy(fm);
+        free(a48k); free(iq4m);
+        dm.active = false;
+        rf10_fifo_stop(&rxq);
+        pthread_join(demod_th, NULL);
+        if (dm.pcm) snd_pcm_close(dm.pcm);
+        rf10_fifo_destroy(&rxq);
+        return;
+    }
+
+    // 3) Run for N seconds: generate 600 Hz tone audio -> mod -> pull 40k IQ -> push to demod FIFO
+    const double seconds = 5.0;
+    const size_t loops   = (size_t)(seconds * 100.0); // 100 * 10ms per second
+    float tone_phase = 0.0f, tone_hz = 600.0f, tone_amp = 0.6f;
+    const float dphi = 2.0f * (float)M_PI * (tone_hz / 48000.0f);
+
+    for (size_t k = 0; k < loops; k++) {
+        // Fill 10 ms of 48k audio using your existing tone gen helper
+        // (If you want to use the local code: replicate fill_tone_48k logic here.)
+        for (size_t i = 0; i < 480; i++) {
+            tone_phase += dphi;
+            if (tone_phase >= 2.0f * (float)M_PI) tone_phase -= 2.0f * (float)M_PI;
+            a48k[i] = tone_amp * sinf(tone_phase);
+        }
+
+        nbfm4m_push_audio(fm, a48k, 480);
+
+        size_t pulled = 0;
+        while (pulled < 40000) {
+            pulled += nbfm4m_pull_iq(fm, iq4m + pulled, 40000 - pulled);
+        }
+
+        // diagnostics: peak amplitude of the 10 ms IQ frame
+        int16_t peak = 0;
+        for (size_t i = 0; i < 40000; i++) {
+            int16_t ai = (int16_t)abs(iq4m[i].i);
+            int16_t aq = (int16_t)abs(iq4m[i].q);
+            if (ai > peak) peak = ai;
+            if (aq > peak) peak = aq;
+        }
+        static int frames_gen = 0;
+        if ((frames_gen++ % 50) == 0) {
+            fprintf(stderr, "MOD: iq_peak=%d (out_scale=%g)\n", peak, cfg.out_scale);
+        }
+
+        rf10_frame_t frm;
+        for (size_t i = 0; i < 40000; i++) {
+            frm.data[i].i = iq4m[i].i;
+            frm.data[i].q = iq4m[i].q;
+        }
+
+        // Block until demod thread consumes (no drops in self-test)
+        if (!rf10_fifo_put(&rxq, &frm, -1)) break;
+    }
+
+    // 4) Teardown
+    dm.active = false;
+    rf10_fifo_stop(&rxq);
+    pthread_join(demod_th, NULL);
+
+    if (dm.pcm) snd_pcm_close(dm.pcm);
+    rf10_fifo_destroy(&rxq);
+    nbfm4m_destroy(fm);
+    free(a48k);
+    free(iq4m);
+
+    fprintf(stderr, "[selftest] done — you should have heard a 600 Hz tone.\n");
 }
 
 void monitor_modem_status(sys_st *sys)
