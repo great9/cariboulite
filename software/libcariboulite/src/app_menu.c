@@ -842,6 +842,49 @@ void print_binairy8(uint8_t value) {
     putchar('\n');
 }
 
+static void write_exact_alsa_16(snd_pcm_t* pcm,
+                                const int16_t* mono,
+                                size_t frames,
+                                unsigned channels)
+{
+    if (channels == 1) {
+        // write mono directly
+        size_t left = frames;
+        const int16_t* p = mono;
+        while (left) {
+            snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, left);
+            if (w == -EPIPE) { snd_pcm_prepare(pcm); continue; }
+            if (w == -EAGAIN) continue;
+            if (w < 0) { fprintf(stderr,"ALSA write err: %s\n", snd_strerror((int)w)); break; }
+            p += w; left -= (size_t)w;
+        }
+        return;
+    }
+
+    // duplicate mono → stereo into a small stack buffer (safe for 480 frames)
+    int16_t interleaved[480 * 2];
+    while (frames) {
+        size_t chunk = frames > 480 ? 480 : frames;
+        for (size_t i = 0, j = 0; i < chunk; ++i) {
+            int16_t s = mono[i];
+            interleaved[j++] = s;
+            interleaved[j++] = s;
+        }
+        size_t left = chunk;
+        const int16_t* p = interleaved;
+        while (left) {
+            snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, left);
+            if (w == -EPIPE) { snd_pcm_prepare(pcm); continue; }
+            if (w == -EAGAIN) continue;
+            if (w < 0) { fprintf(stderr,"ALSA write err: %s\n", snd_strerror((int)w)); break; }
+            p += w * 2;      // 2 samples per frame
+            left -= (size_t)w;
+        }
+        mono   += chunk;
+        frames -= chunk;
+    }
+}
+
 //=================================================
 // --- If needed (when this function appears before the declarations), un-comment these:
 //typedef struct tx_writer_ctrl_st tx_writer_ctrl_st;
@@ -849,6 +892,100 @@ void print_binairy8(uint8_t value) {
 //typedef struct rf10_fifo_s rf10_fifo_t;
 //static void* dsp_producer_thread_func(void*);
 //static void* tx_writer_thread_func(void*);
+
+// ===== 10 ms AUDIO FIFO (producer: demod, consumer: ALSA) =====
+typedef struct {
+    int16_t pcm[480];   // mono, 48 kHz, 10 ms
+} aud10_frame_t;
+
+typedef struct {
+    aud10_frame_t* q;
+    size_t cap, r, w, count;
+    pthread_mutex_t m;
+    pthread_cond_t  can_put, can_get;
+    bool stop;
+    size_t drops;
+} aud10_fifo_t;
+
+static void aud10_fifo_init(aud10_fifo_t* f, size_t cap){
+    memset(f,0,sizeof(*f));
+    f->q = (aud10_frame_t*)calloc(cap,sizeof(aud10_frame_t));
+    f->cap = cap;
+    pthread_mutex_init(&f->m,NULL);
+    pthread_cond_init(&f->can_put,NULL);
+    pthread_cond_init(&f->can_get,NULL);
+}
+static void aud10_fifo_destroy(aud10_fifo_t* f){
+    if(!f) return;
+    pthread_mutex_destroy(&f->m);
+    pthread_cond_destroy(&f->can_put);
+    pthread_cond_destroy(&f->can_get);
+    free(f->q);
+}
+static void aud10_fifo_stop(aud10_fifo_t* f){
+    pthread_mutex_lock(&f->m);
+    f->stop = true;
+    pthread_cond_broadcast(&f->can_put);
+    pthread_cond_broadcast(&f->can_get);
+    pthread_mutex_unlock(&f->m);
+}
+static bool aud10_fifo_put(aud10_fifo_t* f, const aud10_frame_t* frm, int timeout_ms){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    ts.tv_nsec += (long)timeout_ms*1000000L; while(ts.tv_nsec>=1000000000L){ts.tv_nsec-=1000000000L; ts.tv_sec++;}
+    pthread_mutex_lock(&f->m);
+    while(!f->stop && f->count==f->cap){
+        if(timeout_ms<0){ pthread_cond_wait(&f->can_put,&f->m); }
+        else if(pthread_cond_timedwait(&f->can_put,&f->m,&ts)==ETIMEDOUT){ pthread_mutex_unlock(&f->m); return false; }
+    }
+    if(f->stop){ pthread_mutex_unlock(&f->m); return false; }
+    f->q[f->w] = *frm; f->w=(f->w+1)%f->cap; f->count++;
+    pthread_cond_signal(&f->can_get);
+    pthread_mutex_unlock(&f->m);
+    return true;
+}
+static bool aud10_fifo_get(aud10_fifo_t* f, aud10_frame_t* out, int timeout_ms){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    ts.tv_nsec += (long)timeout_ms*1000000L; while(ts.tv_nsec>=1000000000L){ts.tv_nsec-=1000000000L; ts.tv_sec++;}
+    pthread_mutex_lock(&f->m);
+    while(!f->stop && f->count==0){
+        if(timeout_ms<0){ pthread_cond_wait(&f->can_get,&f->m); }
+        else if(pthread_cond_timedwait(&f->can_get,&f->m,&ts)==ETIMEDOUT){ pthread_mutex_unlock(&f->m); return false; }
+    }
+    if(f->stop){ pthread_mutex_unlock(&f->m); return false; }
+    *out = f->q[f->r]; f->r=(f->r+1)%f->cap; f->count--;
+    pthread_cond_signal(&f->can_put);
+    pthread_mutex_unlock(&f->m);
+    return true;
+}
+
+typedef struct {
+    bool active;
+    snd_pcm_t* pcm;
+    unsigned channels;
+    aud10_fifo_t* fifo;     // source of 10 ms audio frames
+    size_t xruns;
+} audio_writer_ctrl_t;
+
+static void* audio_writer_thread(void* arg){
+    audio_writer_ctrl_t* a = (audio_writer_ctrl_t*)arg;
+    pthread_setname_np(pthread_self(),"audio_writer");
+    
+    set_rt_and_affinity(); 
+
+    // optional: make period/blocking behavior nicer
+    while(a->active){
+        aud10_frame_t frm;
+        if(!aud10_fifo_get(a->fifo,&frm, /*timeout_ms=*/50)){
+            // starved: write silence to keep clock steady
+            int16_t zeros[480]={0};
+            write_exact_alsa_16(a->pcm, zeros, 480, a->channels);
+            continue;
+        }
+        // write one 10 ms block; handle xrun inside write_exact_alsa_16()
+        write_exact_alsa_16(a->pcm, frm.pcm, 480, a->channels);
+    }
+    return NULL;
+}
 
 
 // forward decls placed before tx_writer_ctrl_st
@@ -872,6 +1009,7 @@ typedef struct {
     unsigned            pcm_channels;   
     float               pcm_gain;       
     uint64_t            pcm_total_frames; // diag counter
+    aud10_fifo_t*  afifo_out;   // where the 10 ms audio frames go
 } nbfm_demod_ctrl_t;
 
 typedef struct {
@@ -1323,47 +1461,22 @@ static const char* pcm_state_name(snd_pcm_state_t s){
     }
 }
 
-static void write_exact_alsa_16(snd_pcm_t* pcm,
-                                const int16_t* mono,
-                                size_t frames,
-                                unsigned channels)
-{
-    if (channels == 1) {
-        // write mono directly
-        size_t left = frames;
-        const int16_t* p = mono;
-        while (left) {
-            snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, left);
-            if (w == -EPIPE) { snd_pcm_prepare(pcm); continue; }
-            if (w == -EAGAIN) continue;
-            if (w < 0) { fprintf(stderr,"ALSA write err: %s\n", snd_strerror((int)w)); break; }
-            p += w; left -= (size_t)w;
-        }
-        return;
-    }
+// after alsa_open_playback() succeeds:
+static void alsa_tune_sw(snd_pcm_t* pcm){
+    snd_pcm_sw_params_t *sw = NULL;
+    snd_pcm_sw_params_malloc(&sw);
+    snd_pcm_sw_params_current(pcm, sw);
 
-    // duplicate mono → stereo into a small stack buffer (safe for 480 frames)
-    int16_t interleaved[480 * 2];
-    while (frames) {
-        size_t chunk = frames > 480 ? 480 : frames;
-        for (size_t i = 0, j = 0; i < chunk; ++i) {
-            int16_t s = mono[i];
-            interleaved[j++] = s;
-            interleaved[j++] = s;
-        }
-        size_t left = chunk;
-        const int16_t* p = interleaved;
-        while (left) {
-            snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, left);
-            if (w == -EPIPE) { snd_pcm_prepare(pcm); continue; }
-            if (w == -EAGAIN) continue;
-            if (w < 0) { fprintf(stderr,"ALSA write err: %s\n", snd_strerror((int)w)); break; }
-            p += w * 2;      // 2 samples per frame
-            left -= (size_t)w;
-        }
-        mono   += chunk;
-        frames -= chunk;
-    }
+    snd_pcm_uframes_t psize=0, bsize=0;
+    snd_pcm_get_params(pcm, &bsize, &psize); // (buffer_size, period_size)
+
+    // Don't start until the buffer is nearly full — prevents initial XRUN/stutter.
+    snd_pcm_sw_params_set_start_threshold(pcm, sw, bsize - psize);
+    // Wake writer when at least one period is free.
+    snd_pcm_sw_params_set_avail_min(pcm, sw, psize);
+
+    snd_pcm_sw_params(pcm, sw);
+    snd_pcm_sw_params_free(sw);
 }
 
 static int alsa_open_playback(snd_pcm_t **ppcm,
@@ -1520,98 +1633,160 @@ static inline float deemph_48k(float x, float *z, float tau_s)
 // }
 
 // --- FM discriminator (atan2), 3/250 resample to 48k, deemphasis at 48k ---
+// --- Pre-demod CIC decimator (20 x 4) -> 50 kS/s, then limiter+atan2, 50k->48k, deemph @48k ---
+// --- FM discriminator (atan2), 4M->50k integrate&dump, adaptive 50k->48k, deemph @48k ---
+// --- FM discriminator (atan2), 4M->50k I&D, fixed 50k->48k (24/25), DC block, deemph @48k
+// --- NBFM demod: I/Q integrate&dump to 50k -> limiter -> discriminator @50k
+//                  -> fixed 24/25 resample to 48k -> DC block -> deemph -> light LPF
 static void* nbfm_demod_thread(void* arg)
 {
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
-    const float fs_in  = c->fs_rf;      // 4e6
-    const float fs_out = c->fs_audio;   // 48k
-    const int   L = 3, M = 250;         // 4e6 * 3/250 = 48k
-    const float step = (float)M / (float)L;  // 83.333...
-    (void)fs_out; // kept for clarity
+    if (!c || !c->fifo_in || !c->pcm) return NULL;
 
-    // --- normalize discriminator so full deviation → ~±1 before deemph ---
-    const float f_dev_hz = 2500.0f;                     // must match your modulator
-    const float K_norm   = fs_in / (2.0f * (float)M_PI * f_dev_hz);
+    // 4e6 -> 50k via integrate & dump: 20x then 4x (total 80x)
+    enum { D1 = 20, D2 = 4 };                // 4e6 / 80 = 50 kS/s
+    const float fs_mid = 50000.0f;
 
-    // output block = 10 ms @ 48k = 480 samples
+    // FM deviation (matches your TX)
+    const float f_dev  = 2500.0f;
+    const float K_norm = fs_mid / (2.0f * (float)M_PI * f_dev);   // scale dphi -> ~±1 at ±dev
+
+    // 50k -> 48k via fixed rational 24/25 (exact)
+    const int   L = 24, M = 25;
+    int         acc = 0;                     // integer accumulator (drift-free)
+    float       y_prev_50k = 0.0f, y_curr_50k = 0.0f;
+
+    // Optional vector limiter
+    const int use_limiter = 1;
+
+    // DC blocker at 48k (~5 Hz HPF)
+    const float dc_fc = 5.0f;
+    const float dc_a  = expf(-2.0f * (float)M_PI * dc_fc / 48000.0f);
+    float dc_y = 0.0f, x_prev_audio = 0.0f;
+
+    // De-emphasis state (48k)
+    float deemph_state = 0.0f;
+
+    // Gentle audio LPF post-deemph (~3.2 kHz, 1st order)
+    const float lpf_fc = 3200.0f;
+    const float lpf_a  = expf(-2.0f * (float)M_PI * lpf_fc / 48000.0f);
+    const float lpf_b  = 1.0f - lpf_a;
+    float lpf_y = 0.0f;
+
+    // Previous decimated complex sample for discriminator
+    float pi50 = 0.0f, pq50 = 0.0f;
+    int   have_prev50 = 0;
+
+    // I&D accumulators on I and Q (do NOT demod at 4M)
+    float ai1 = 0.0f, aq1 = 0.0f; int cnt1 = 0;
+    float ai2 = 0.0f, aq2 = 0.0f; int cnt2 = 0;
+
+    // ALSA 10 ms block
     int16_t audio_10ms[480];
+    size_t  nout = 0;
 
-    float acc = 0.0f;                 // fractional downsample accumulator (your scheme)
-    float deemph_state = 0.0f;        // deemphasis state @ 48 kHz
-    int16_t pi = 0, pq = 0;           // previous I/Q for discrim
-    int      have_prev = 0;
+    // heartbeat
+    uint64_t last_log_ms = 0;
 
     while (c->active) {
         rf10_frame_t frm;
         if (!rf10_fifo_get(c->fifo_in, &frm, -1)) continue;
 
-        size_t nout = 0;              // how many 48k samples filled in this 10 ms block
-
-        // process 40k IQ @ 4 MS/s
         for (size_t n = 0; n < 40000; n++) {
-            const int16_t ci16 = frm.data[n].i;
-            const int16_t cq16 = frm.data[n].q;
+            // --- accumulate @ 4M (stage-1) ---
+            ai1 += (float)frm.data[n].i;
+            aq1 += (float)frm.data[n].q;
+            if (++cnt1 != D1) continue;
 
-            if (!have_prev) {
-                pi = ci16; pq = cq16;
-                have_prev = 1;
-                continue;
+            // boxcar avg #1
+            float i1 = ai1 / (float)D1;
+            float q1 = aq1 / (float)D1;
+            ai1 = aq1 = 0.0f; cnt1 = 0;
+
+            // --- accumulate @ 200k (stage-2 to 50k) ---
+            ai2 += i1;
+            aq2 += q1;
+            if (++cnt2 != D2) continue;
+
+            // boxcar avg #2 -> 50 kS/s complex sample
+            float i50 = ai2 / (float)D2;
+            float q50 = aq2 / (float)D2;
+            ai2 = aq2 = 0.0f; cnt2 = 0;
+
+            // --- limiter (unit vector) ---
+            if (use_limiter) {
+                float m2 = i50*i50 + q50*q50;
+                if (m2 > 0.0f) {
+                    float invm = 1.0f / sqrtf(m2);
+                    i50 *= invm; q50 *= invm;
+                }
             }
 
-            // --- true phase-step discriminator: s[n] * conj(s[n-1]) ---
-            const float ci = (float)ci16, cq = (float)cq16;
-            const float pi_f = (float)pi,   pq_f = (float)pq;
-
-            const float real = ci * pi_f + cq * pq_f;
-            const float imag = cq * pi_f - ci * pq_f;
-            const float dphi = atan2f(imag, real);   // radians
-            const float y    = dphi * K_norm;        // normalized (±1 at full dev)
-            
-            static double m=0, s2=0; static uint64_t k=0;
-            k++; double e=dphi; double d=e - m; m += d/k; s2 += d*(e - m);
-            if ((k % (40000*10)) == 0) { // about 0.1 s at 4 MS/s
-                double rms = sqrt(s2/k);
-                fprintf(stderr, "dphi mean=%.3g, rms=%.3g\n", m, rms);
-                k=0; m=0; s2=0;
+            // --- discriminator at 50 kS/s using previous 50k sample ---
+            float y50 = 0.0f;
+            if (have_prev50) {
+                const float re = i50 * pi50 + q50 * pq50;
+                const float im = q50 * pi50 - i50 * pq50;
+                const float dphi = atan2f(im, re);     // [-π, π]
+                y50 = dphi * K_norm;                   // normalize to ~±1 @ ±dev
+            } else {
+                have_prev50 = 1;
             }
+            pi50 = i50; pq50 = q50;
 
-            // --- fractional downsample to 48k (keep your acc/step scheme) ---
-            acc -= 1.0f;
-            while (acc <= 0.0f) {
-                // deemphasis at the AUDIO rate (48 kHz), then scale to int16
-                float ya = deemph_48k(y, &deemph_state, c->deemph_tau);
-                float s  = ya * c->pcm_gain;
+            // --- 50k -> 48k fixed 24/25 with linear interpolation ---
+            y_prev_50k = y_curr_50k;
+            y_curr_50k = y50;
+            acc -= M;                                  // one 50k input arrived
+            while (acc <= 0) {
+                // linear interp between last two 50k samples
+                float frac = (float)(acc + M) / (float)M;
+                if (frac < 0.f) frac = 0.f; else if (frac > 1.f) frac = 1.f;
+                float y_lin = y_prev_50k + frac * (y_curr_50k - y_prev_50k);
+
+                // DC block @ 48k
+                float x = y_lin;
+                float y = (x - x_prev_audio) + dc_a * dc_y;
+                x_prev_audio = x;
+                dc_y = y;
+
+                // de-emphasis @ 48k
+                float yd = deemph_48k(y, &deemph_state, c->deemph_tau);
+
+                // gentle audio LPF (~3.2 kHz) to tame residual hiss
+                lpf_y = lpf_a * lpf_y + lpf_b * yd;
+                float ya = lpf_y;
+
+                // to int16 with gain
+                float s = ya * c->pcm_gain;
                 if (s >  32767.f) s =  32767.f;
                 if (s < -32768.f) s = -32768.f;
                 audio_10ms[nout++] = (int16_t)lrintf(s);
 
-                acc += step;
-                if (nout == 480) break; // exactly 10 ms payload
-            }
+                acc += L;
 
-            // advance discrim state
-            pi = ci16; pq = cq16;
+                if (nout == 480) {
+                    //write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
+                    aud10_frame_t frm;
+                    memcpy(frm.pcm, audio_10ms, sizeof(audio_10ms));
+                    aud10_fifo_put(c->afifo_out, &frm, /*timeout_ms=*/10);  // short wait; writer will smooth
+                    c->pcm_total_frames += 480;
+                    nout = 0;
 
-            // ship one 10 ms frame whenever ready
-            static uint64_t last_ms = 0;
-            if (nout == 480) {
-                write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
-                c->pcm_total_frames += 480;
-
-                // light progress log (~1 Hz)
-                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
-                if (!last_ms) last_ms = ms;
-                if (ms - last_ms >= 1000) {
-                    fprintf(stderr,
-                        "DEMOD: played ~%llu frames (%.1f s), ALSA state=%s, ch=%u\n",
-                        (unsigned long long)c->pcm_total_frames,
-                        (double)c->pcm_total_frames / (double)c->pcm_rate,
-                        pcm_state_name(snd_pcm_state(c->pcm)),
-                        c->pcm_channels);
-                    last_ms = ms;
+                    // heartbeat once per ~1 s
+                    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                    uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+                    if (!last_log_ms) last_log_ms = ms;
+                    if (ms - last_log_ms >= 1000) {
+                        fprintf(stderr,
+                            "DEMOD: frames=%llu (%.1fs) ALSA=%s ch=%u  mid=50k  ratio=24/25\n",
+                            (unsigned long long)c->pcm_total_frames,
+                            (double)c->pcm_total_frames / (double)c->pcm_rate,
+                            pcm_state_name(snd_pcm_state(c->pcm)),
+                            c->pcm_channels);
+                        last_log_ms = ms;
+                    }
                 }
-                nout = 0;
             }
         }
     }
@@ -1926,13 +2101,19 @@ static void nbfm_rx(sys_st *sys)
         .pcm_gain = 8000.0f,          // <-- boost a bit so you *hear* it
         .pcm_total_frames = 0,
     };
-    
-	// open with channel detection
+
+    // --- create audio FIFO + writer
+    aud10_fifo_t afifo;
+    aud10_fifo_init(&afifo, /*cap=*/64); // ~640 ms cushion
+
+    // open with channel detection
     if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
         fprintf(stderr, "[nbfm_rx] alsa_open_playback failed\n");
         return;
     }
-
+    
+    alsa_tune_sw(dm.pcm);
+    
     // ping: quick ping of 1.5 kHz tone to verify audio path is working
     int16_t ping[12000]; // 0.25s @ 48k
     for (int i = 0; i < 12000; i++) {
@@ -1940,6 +2121,25 @@ static void nbfm_rx(sys_st *sys)
         ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
     }
     write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
+    
+
+    audio_writer_ctrl_t aw = {
+        .active   = true,
+        .pcm      = dm.pcm,
+        .channels = dm.pcm_channels,
+        .fifo     = &afifo,
+        .xruns    = 0,
+    };
+    pthread_t aw_th;
+    pthread_create(&aw_th, NULL, audio_writer_thread, &aw);
+
+    // pass to demod
+    dm.afifo_out = &afifo;
+    
+    for (int i = 0; i < 8; i++) {         // ~80 ms cushion
+    aud10_frame_t z = {0};
+    aud10_fifo_put(&afifo, &z, -1);
+}
 
     pthread_t demod_th;
 	pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
@@ -1999,6 +2199,8 @@ static void nbfm_rx(sys_st *sys)
 
     // --- Teardown (same order/pattern as monitor_modem_status) ---
 	dm.active = false;
+    aud10_fifo_stop(&afifo);
+    aw.active = false;
     nbfm_rx_active = false;
     smi_idle(sys);
 
@@ -2012,10 +2214,13 @@ static void nbfm_rx(sys_st *sys)
 
     pthread_cancel(demod_th);
     pthread_cancel(rx_th);
+    pthread_cancel(aw_th);
     pthread_join(demod_th, NULL);
     pthread_join(rx_th, NULL);
+    pthread_join(aw_th, NULL);
 
     rf10_fifo_destroy(&rxq);
+    aud10_fifo_destroy(&afifo);
     if (dm.pcm) snd_pcm_close(dm.pcm);
 
     
@@ -2044,6 +2249,10 @@ static void nbfm_modem_selftest(sys_st *sys)
         .pcm         = NULL,
     };
 
+    // before starting demod_th
+    aud10_fifo_t afifo;
+    aud10_fifo_init(&afifo, 64);
+
     // Use your playback opener (change device as needed: "default", "plughw:USB,0", etc.)
     unsigned rate=0, ch=0;
     if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
@@ -2051,9 +2260,9 @@ static void nbfm_modem_selftest(sys_st *sys)
         rf10_fifo_destroy(&rxq);
         return;
     }
-    dm.pcm_gain = 12000.0f;
-    dm.pcm_channels = ch ? ch : 1;
     
+    alsa_tune_sw(dm.pcm);
+
     // ping: quick ping of 1.5 kHz tone to verify audio path is working
     int16_t ping[12000]; // 0.25s @ 48k
     for (int i = 0; i < 12000; i++) {
@@ -2062,6 +2271,21 @@ static void nbfm_modem_selftest(sys_st *sys)
     }
     write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
 
+
+    audio_writer_ctrl_t aw = {
+        .active   = true,
+        .pcm      = dm.pcm,
+        .channels = dm.pcm_channels,
+        .fifo     = &afifo,
+    };
+    pthread_t aw_th;
+    pthread_create(&aw_th, NULL, audio_writer_thread, &aw);
+
+    dm.afifo_out = &afifo;
+    dm.pcm_gain = 12000.0f;
+    dm.pcm_channels = ch ? ch : 1;
+    
+    
 
 
     pthread_t demod_th;
@@ -2093,7 +2317,7 @@ static void nbfm_modem_selftest(sys_st *sys)
     }
 
     // 3) Run for N seconds: generate 600 Hz tone audio -> mod -> pull 40k IQ -> push to demod FIFO
-    const double seconds = 5.0;
+    const double seconds = 15.0;
     const size_t loops   = (size_t)(seconds * 100.0); // 100 * 10ms per second
     float tone_phase = 0.0f, tone_hz = 600.0f, tone_amp = 0.6f;
     const float dphi = 2.0f * (float)M_PI * (tone_hz / 48000.0f);
@@ -2139,14 +2363,24 @@ static void nbfm_modem_selftest(sys_st *sys)
 
     // 4) Teardown
     dm.active = false;
+    aw.active = false;
     rf10_fifo_stop(&rxq);
+    aud10_fifo_stop(&afifo);
     pthread_join(demod_th, NULL);
+    pthread_cancel(aw_th);
+    pthread_join(aw_th, NULL);
 
     if (dm.pcm) snd_pcm_close(dm.pcm);
+    aud10_fifo_destroy(&afifo);
     rf10_fifo_destroy(&rxq);
     nbfm4m_destroy(fm);
+    
     free(a48k);
     free(iq4m);
+    
+    
+    
+    
 
     fprintf(stderr, "[selftest] done — you should have heard a 600 Hz tone.\n");
 }
