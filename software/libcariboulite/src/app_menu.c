@@ -1399,6 +1399,9 @@ static inline void fill_tone_48k(tx_writer_ctrl_st* ctrl, float* buf, size_t n)
 
 static void* rx_reader_thread_func(void* arg)
 {
+    pthread_setname_np(pthread_self(),"rx_reader_thread");
+    set_rt_and_affinity(); 
+
     rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
     caribou_smi_st *smi = &ctrl->radio->sys->smi;
 
@@ -1640,6 +1643,9 @@ static inline float deemph_48k(float x, float *z, float tau_s)
 //                  -> fixed 24/25 resample to 48k -> DC block -> deemph -> light LPF
 static void* nbfm_demod_thread(void* arg)
 {
+    pthread_setname_np(pthread_self(),"nbfm_demod_thread");
+    set_rt_and_affinity();             
+    
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
     if (!c || !c->fifo_in || !c->pcm) return NULL;
 
@@ -1769,7 +1775,7 @@ static void* nbfm_demod_thread(void* arg)
                     //write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
                     aud10_frame_t frm;
                     memcpy(frm.pcm, audio_10ms, sizeof(audio_10ms));
-                    aud10_fifo_put(c->afifo_out, &frm, /*timeout_ms=*/10);  // short wait; writer will smooth
+                    aud10_fifo_put(c->afifo_out, &frm, /*timeout_ms=*/-1);  // short wait; writer will smooth
                     c->pcm_total_frames += 480;
                     nout = 0;
 
