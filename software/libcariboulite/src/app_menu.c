@@ -551,6 +551,8 @@ static void print_iq(char* prefix, cariboulite_sample_complex_int16* buffer, siz
 
 static void* reader_thread_func(void* arg)
 {
+    pthread_setname_np(pthread_self(), "reader_thread");
+    set_rt_and_affinity();
     iq_test_reader_st* ctrl = (iq_test_reader_st*)arg;
     cariboulite_radio_state_st *cur_radio = NULL;
     size_t read_len = caribou_smi_get_native_batch_samples(&ctrl->sys->smi);
@@ -968,18 +970,19 @@ typedef struct {
 
 static void* audio_writer_thread(void* arg){
     audio_writer_ctrl_t* a = (audio_writer_ctrl_t*)arg;
-    pthread_setname_np(pthread_self(),"audio_writer");
+    pthread_setname_np(pthread_self(),"audio_writer_thread");
     
     set_rt_and_affinity(); 
 
     // optional: make period/blocking behavior nicer
     while(a->active){
         aud10_frame_t frm;
-        if(!aud10_fifo_get(a->fifo,&frm, /*timeout_ms=*/50)){
+        if(!aud10_fifo_get(a->fifo,&frm, /*timeout_ms=*/-1)){
             // starved: write silence to keep clock steady
-            int16_t zeros[480]={0};
-            write_exact_alsa_16(a->pcm, zeros, 480, a->channels);
-            continue;
+            //int16_t zeros[480]={0};
+            //write_exact_alsa_16(a->pcm, zeros, 480, a->channels);
+            //continue;
+            break;
         }
         // write one 10 ms block; handle xrun inside write_exact_alsa_16()
         write_exact_alsa_16(a->pcm, frm.pcm, 480, a->channels);
@@ -1220,7 +1223,7 @@ static void read_audio_exact(alsa48k_source_t* mic, float* buf, size_t need);
 
 static void* dsp_producer_thread_func(void* arg)
 {
-    pthread_setname_np(pthread_self(), "dsp_producer");
+    pthread_setname_np(pthread_self(), "dsp_producer_thread");
     set_rt_and_affinity();   // make sure this logs failures
 
     dsp_producer_ctrl_t* ctrl = (dsp_producer_ctrl_t*)arg;
@@ -1816,7 +1819,8 @@ static void read_audio_exact(alsa48k_source_t* mic, float* buf, size_t need)
 
 static void* tx_writer_thread_func(void* arg)
 {
-    pthread_setname_np(pthread_self(), "tx_writer");
+    pthread_setname_np(pthread_self(), "tx_writer_thread");
+    set_rt_and_affinity();
 
     tx_writer_ctrl_st* ctrl = (tx_writer_ctrl_st*)arg;
     if (!ctrl || !ctrl->radio || !ctrl->radio->sys) return NULL;
@@ -1826,8 +1830,6 @@ static void* tx_writer_thread_func(void* arg)
 
     rf10_fifo_t* fifo = ctrl->fifo;
     if (!fifo) return NULL;
-
-    set_rt_and_affinity();
 
     const caribou_smi_channel_en ch =
         (ctrl->radio == &ctrl->radio->sys->radio_low) ?
