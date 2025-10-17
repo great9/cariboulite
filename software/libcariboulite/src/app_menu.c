@@ -888,12 +888,6 @@ static void write_exact_alsa_16(snd_pcm_t* pcm,
 }
 
 //=================================================
-// --- If needed (when this function appears before the declarations), un-comment these:
-//typedef struct tx_writer_ctrl_st tx_writer_ctrl_st;
-//typedef struct dsp_producer_ctrl_t dsp_producer_ctrl_t;
-//typedef struct rf10_fifo_s rf10_fifo_t;
-//static void* dsp_producer_thread_func(void*);
-//static void* tx_writer_thread_func(void*);
 
 // ===== 10 ms AUDIO FIFO (producer: demod, consumer: ALSA) =====
 typedef struct {
@@ -1311,11 +1305,6 @@ static void* dsp_producer_thread_func(void* arg)
 
 static size_t tx_sample_index = 0; 
 
-// static float g_sine80[80];
-// static void init_sine80(void){
-//     for (int i=0;i<80;i++)
-//         g_sine80[i] = sinf(2.f * (float)M_PI * (float)i / 80.f);
-// }
 
 static inline void fill_tone_48k(tx_writer_ctrl_st* ctrl, float* buf, size_t n)
 {
@@ -1334,71 +1323,6 @@ static inline void fill_tone_48k(tx_writer_ctrl_st* ctrl, float* buf, size_t n)
     ctrl->tone_phase = phase;
 }
 
-// static void* rx_reader_thread_func(void* arg)
-// {
-//     pthread_setname_np(pthread_self(), "rx_reader");
-
-// 	rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
-//     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-//     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-
-//     caribou_smi_st *smi = &ctrl->radio->sys->smi;
-
-//     // Start with a sane batch; may grow if native gets bigger
-//     size_t native_bytes = caribou_smi_get_native_batch_samples(smi);
-//     size_t batch        = native_bytes ? (native_bytes / CARIBOU_SMI_BYTES_PER_SAMPLE) : 32768;
-//     if (batch > ctrl->rx_buffer_size) batch = ctrl->rx_buffer_size;
-
-//     cariboulite_sample_meta* metadata = malloc(sizeof(*metadata) * batch);
-//     if (!metadata) return NULL;
-
-//     // tiny nap helper (50 µs)
-//     const struct timespec ts50us = { .tv_sec = 0, .tv_nsec = 50 * 1000 };
-
-//     while (ctrl->active) {
-//         pthread_testcancel();
-
-//         if (!nbfm_rx_active) {
-//             nanosleep(&ts50us, NULL);
-//             continue;
-//         }
-
-//         // Track native batch occasionally (in case driver changes it)
-//         size_t nb = caribou_smi_get_native_batch_samples(smi);
-//         size_t new_batch = nb ? (nb / CARIBOU_SMI_BYTES_PER_SAMPLE) : batch;
-//         if (new_batch == 0) new_batch = batch;
-//         if (new_batch > ctrl->rx_buffer_size) new_batch = ctrl->rx_buffer_size;
-
-//         if (new_batch > batch) {
-//             // grow metadata if needed
-//             cariboulite_sample_meta* m2 = realloc(metadata, sizeof(*metadata) * new_batch);
-//             if (m2) {
-//                 metadata = m2;
-//                 batch = new_batch;
-//             }
-//         } else {
-//             batch = new_batch;
-//         }
-
-//         // Blocking read for *one* native batch keeps latency low and UI snappy
-//         int ret = cariboulite_radio_read_samples(ctrl->radio,
-//                                                  ctrl->rx_buffer,
-//                                                  metadata,
-//                                                  batch);
-//         if (ret > 0) {
-//             latest_rx_sample = ctrl->rx_buffer[ret >> 1];  // mid-sample snapshot
-//         } else if (ret == 0) {
-//             // no data right now; avoid hot spin
-//             nanosleep(&ts50us, NULL);
-//         } else {
-//             // error; brief backoff
-//             const struct timespec ts200us = { .tv_sec = 0, .tv_nsec = 200 * 1000 };
-//             nanosleep(&ts200us, NULL);
-//         }
-//     }
-//     free(metadata);
-//     return NULL;
-// }
 
 static void* rx_reader_thread_func(void* arg)
 {
@@ -1435,26 +1359,6 @@ static void* rx_reader_thread_func(void* arg)
     return NULL;
 }
 
-// --- very small ALSA playback helper (16-bit mono, 48k) ---
-// static int alsa_open_playback(snd_pcm_t **ppcm, const char* dev)
-// {
-//     snd_pcm_t* pcm = NULL;
-//     snd_pcm_hw_params_t* hw = NULL;
-
-//     if (snd_pcm_open(&pcm, dev ? dev : "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) return -1;
-//     snd_pcm_hw_params_malloc(&hw);
-//     snd_pcm_hw_params_any(pcm, hw);
-//     snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-//     snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
-//     unsigned int rate = 48000; int dir = 0;
-//     snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, &dir);
-//     snd_pcm_hw_params_set_channels(pcm, hw, 1);
-//     snd_pcm_hw_params(pcm, hw);
-//     snd_pcm_hw_params_free(hw);
-//     snd_pcm_prepare(pcm);
-//     *ppcm = pcm;
-//     return 0;
-// }
 
 static const char* pcm_state_name(snd_pcm_state_t s){
     switch (s){
@@ -1564,83 +1468,6 @@ static inline float deemph_48k(float x, float *z, float tau_s)
     return *z;
 }
 
-// // --- FM discriminator + deemph + 3/250 resample to 48k --
-// static void* nbfm_demod_thread(void* arg)
-// {
-//     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
-//     const float fs_in = c->fs_rf;     // 4e6
-//     const float fs_out = c->fs_audio; // 48k
-//     const int L = 3, M = 250;         // 4e6 * 3/250 = 48k
-//     const float step = (float)M / (float)L;  // 83.333...
-    
-//     // output block = 10 ms @ 48k = 480 samples
-//     int16_t audio_10ms[480];
-
-//     float acc = 0.0f;                 // fractional index accumulator (in input samples)
-//     float deemph_state = 0.0f;
-//     int16_t pi = 0, pq = 0;
-
-//     while (c->active) {
-//         rf10_frame_t frm;
-//         if (!rf10_fifo_get(c->fifo_in, &frm, -1)) continue;
-
-//         // process 40k IQ @ 4 MS/s
-//         // (prev sample carries across frames)
-//         size_t nout = 0;
-//         for (size_t n = 0; n < 40000; n++) {
-//             int16_t ci = frm.data[n].i;
-//             int16_t cq = frm.data[n].q;
-
-//             // FM discrim (small-angle approx)
-//             int num =  (int)pi * (int)cq - (int)pq * (int)ci;
-//             int den =  (int)pi * (int)ci + (int)pq * (int)cq;
-//             if (den == 0) den = 1;
-//             float fm = (float)num / (float)den;        // ~ phase delta
-
-//             // de-emphasis (e.g., 75 us). Do it at RF fs then resample.
-//             float y = deemph(fm, &deemph_state, c->deemph_tau, fs_in);
-
-//             // fractional downsample to 48k by linear interpolation on the 4M stream:
-//             // output whenever acc <= 0, then acc += step; otherwise acc -= 1 per input.
-//             // (equivalently: keep a running "when to emit" schedule)
-//             acc -= 1.0f;
-//             while (acc <= 0.0f) {
-//                 // linear interp between current y and previous y (we need y[n] & y[n-1])
-//                 // For simplicity, just take current y (acceptable for NBFM voice).
-//                 //float s = y * 12000.0f; // scale for comfortable audio level
-//                 float s = y * c->pcm_gain; // c->pcm_gain set per test/RX
-//                 if (s > 32767.0f) s = 32767.0f;
-//                 if (s < -32768.0f) s = -32768.0f;
-//                 audio_10ms[nout++] = (int16_t)lrintf(s);
-//                 acc += step;
-//                 if (nout == 480) break; // exactly 10 ms
-//             }
-//             static uint64_t last_ms = 0;
-//             pi = ci; pq = cq;
-//             if (nout == 480) {
-//                 // write one 10 ms frame to ALSA
-//                 write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
-//                 c->pcm_total_frames += 480;
-
-//                 // once per ~1s, print that we’re alive
-//                 struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-//                 uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
-//                 if (!last_ms) last_ms = ms;
-//                 if (ms - last_ms >= 1000) {
-//                     fprintf(stderr, "DEMOD: played ~%llu frames (%.1f s), ALSA state=%s, ch=%u\n",
-//                             (unsigned long long)c->pcm_total_frames,
-//                             (double)c->pcm_total_frames / (double)c->pcm_rate,
-//                             pcm_state_name(snd_pcm_state(c->pcm)),
-//                             c->pcm_channels);
-//                     last_ms = ms;
-//                 }
-
-//                 nout = 0;
-//             }
-//         }
-//     }
-//     return NULL;
-// }
 
 // --- FM discriminator (atan2), 3/250 resample to 48k, deemphasis at 48k ---
 // --- Pre-demod CIC decimator (20 x 4) -> 50 kS/s, then limiter+atan2, 50k->48k, deemph @48k ---
@@ -2126,10 +1953,10 @@ static void nbfm_rx(sys_st *sys)
     
     alsa_tune_sw(dm.pcm);
     
-    // ping: quick ping of 1.5 kHz tone to verify audio path is working
+    // ping: quick ping of 2.525 kHz quidar tone to verify audio path is working
     int16_t ping[12000]; // 0.25s @ 48k
     for (int i = 0; i < 12000; i++) {
-        float x = sinf(2.f * M_PI * 1500.f * (float)i / 48000.f);
+        float x = sinf(2.f * M_PI * 2525.f * (float)i / 48000.f);
         ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
     }
     write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
@@ -2231,6 +2058,16 @@ static void nbfm_rx(sys_st *sys)
     pthread_join(rx_th, NULL);
     pthread_join(aw_th, NULL);
 
+    // ping: quick ping of 2.475 kHz tone to signal audio path is closing
+    // int16_t ping[12000]; // 0.25s @ 48k
+    for (int i = 0; i < 12000; i++) {
+        float x = sinf(2.f * M_PI * 2475.f * (float)i / 48000.f);
+        ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
+    }
+    write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
+    usleep(250 * 1000);
+
+
     rf10_fifo_destroy(&rxq);
     aud10_fifo_destroy(&afifo);
     if (dm.pcm) snd_pcm_close(dm.pcm);
@@ -2275,10 +2112,10 @@ static void nbfm_modem_selftest(sys_st *sys)
     
     alsa_tune_sw(dm.pcm);
 
-    // ping: quick ping of 1.5 kHz tone to verify audio path is working
+    // ping: quick ping of 2.525 kHz quindar tone to verify audio path is working
     int16_t ping[12000]; // 0.25s @ 48k
     for (int i = 0; i < 12000; i++) {
-        float x = sinf(2.f * M_PI * 1500.f * (float)i / 48000.f);
+        float x = sinf(2.f * M_PI * 2525.f * (float)i / 48000.f);
         ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
     }
     write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
@@ -2297,9 +2134,6 @@ static void nbfm_modem_selftest(sys_st *sys)
     dm.pcm_gain = 12000.0f;
     dm.pcm_channels = ch ? ch : 1;
     
-    
-
-
     pthread_t demod_th;
     pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
 
@@ -2329,7 +2163,7 @@ static void nbfm_modem_selftest(sys_st *sys)
     }
 
     // 3) Run for N seconds: generate 600 Hz tone audio -> mod -> pull 40k IQ -> push to demod FIFO
-    const double seconds = 15.0;
+    const double seconds = 5.0;
     const size_t loops   = (size_t)(seconds * 100.0); // 100 * 10ms per second
     float tone_phase = 0.0f, tone_hz = 600.0f, tone_amp = 0.6f;
     const float dphi = 2.0f * (float)M_PI * (tone_hz / 48000.0f);
@@ -2381,6 +2215,15 @@ static void nbfm_modem_selftest(sys_st *sys)
     pthread_join(demod_th, NULL);
     pthread_cancel(aw_th);
     pthread_join(aw_th, NULL);
+
+    // ping: quick ping of 2.475 kHz tone to signal audio path is closing
+    // int16_t ping[12000]; // 0.25s @ 48k
+    for (int i = 0; i < 12000; i++) {
+        float x = sinf(2.f * M_PI * 2475.f * (float)i / 48000.f);
+        ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
+    }
+    write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/1);  // same as speaker-test
+    usleep(250 * 1000); // wait a little so the tone doesn't get cut off
 
     if (dm.pcm) snd_pcm_close(dm.pcm);
     aud10_fifo_destroy(&afifo);
