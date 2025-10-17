@@ -2640,8 +2640,9 @@ void monitor_modem_status(sys_st *sys)
 			{
 				HW_LOCK();
 				caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_tx_lowpass);
-				cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
-				caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)3); // TX
+				//caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_tx_hipass);
+                cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
+				caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)3); // TX
 				HW_UNLOCK();
 
 				__sync_synchronize();          // memory barrier
@@ -2678,8 +2679,10 @@ void monitor_modem_status(sys_st *sys)
                 nbfm_rx_active = true;
                 HW_LOCK();
                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_rx_lowpass);
+                //caribou_fpga_set_io_ctrl_mode(&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_rx_hipass);
                 cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, true);
-                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)1); // <-- add this
+                caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)1); // <-- add this
+                //caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)2); // <-- add this
                 HW_UNLOCK();
             } else {
                 nbfm_rx_active = false;
