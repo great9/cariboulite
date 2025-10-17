@@ -1423,7 +1423,11 @@ static void* rx_reader_thread_func(void* arg)
                 frm.data[i].i = buf[i].i;
                 frm.data[i].q = buf[i].q;
             }
-            rf10_fifo_put(ctrl->rx_fifo /*add to ctrl*/, &frm, -1);
+            //rf10_fifo_put(ctrl->rx_fifo /*add to ctrl*/, &frm, -1);
+            if (!rf10_fifo_put(ctrl->rx_fifo, &frm, /*timeout_ms=*/0)) {
+                // FIFO full -> overwrite oldest already happened; just continue
+                // (you can keep a counter if you want to log drops)
+            }
             have = 0;
         }
     }
@@ -2075,13 +2079,13 @@ static void nbfm_rx(sys_st *sys)
     nbfm_tx_active = false;
     nbfm_rx_active = false;
 
-    double frequency = 430100000;   // Hz
+    double frequency = 430275000;   // Hz
 
     cariboulite_radio_state_st *radio = &sys->radio_low;
 
     // FIFO for 10ms frames
     rf10_fifo_t rxq;
-    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/false);
+    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/true);
 
     // RX reader
 	rx_reader_ctrl_st rx = {
@@ -2243,7 +2247,7 @@ static void nbfm_modem_selftest(sys_st *sys)
 
     // 1) Create RX FIFO and start the existing demod thread pointing to ALSA
     rf10_fifo_t rxq;
-    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/false);
+    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/true);
 
     nbfm_demod_ctrl_t dm = {
         .active      = true,
