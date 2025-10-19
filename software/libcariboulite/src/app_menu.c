@@ -140,6 +140,16 @@ static inline uint64_t mono_ns(void){
     return (uint64_t)ts.tv_sec*1000000000ull + ts.tv_nsec;
 }
 
+static inline void set_rt_and_affinity_prio(int prio, int cpu){
+    struct sched_param sp = { .sched_priority = prio };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+#ifdef __linux__
+    cpu_set_t set; CPU_ZERO(&set);
+    CPU_SET(cpu >= 0 ? cpu : 0, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#endif
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+}
 
 static inline void set_rt_and_affinity(void)
 {
@@ -963,10 +973,12 @@ typedef struct {
 } audio_writer_ctrl_t;
 
 static void* audio_writer_thread(void* arg){
+    
     audio_writer_ctrl_t* a = (audio_writer_ctrl_t*)arg;
     pthread_setname_np(pthread_self(),"audio_writer_thread");
     
-    set_rt_and_affinity(); 
+    //set_rt_and_affinity();
+    set_rt_and_affinity_prio(36,2); 
 
     // optional: make period/blocking behavior nicer
     while(a->active){
@@ -1218,7 +1230,8 @@ static void read_audio_exact(alsa48k_source_t* mic, float* buf, size_t need);
 static void* dsp_producer_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(), "dsp_producer_thread");
-    set_rt_and_affinity();   // make sure this logs failures
+    //set_rt_and_affinity();   // make sure this logs failures
+    set_rt_and_affinity_prio(45,2);
 
     dsp_producer_ctrl_t* ctrl = (dsp_producer_ctrl_t*)arg;
     if (!ctrl || !ctrl->tx || !ctrl->tx->fm || !ctrl->fifo ||
@@ -1327,7 +1340,8 @@ static inline void fill_tone_48k(tx_writer_ctrl_st* ctrl, float* buf, size_t n)
 static void* rx_reader_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(),"rx_reader_thread");
-    set_rt_and_affinity(); 
+    //set_rt_and_affinity();
+    set_rt_and_affinity_prio(38, 2); 
 
     rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
     caribou_smi_st *smi = &ctrl->radio->sys->smi;
@@ -1484,7 +1498,8 @@ static inline float deemph_48k(float x, float *z, float tau_s)
 static void* nbfm_demod_thread(void* arg)
 {
     pthread_setname_np(pthread_self(),"nbfm_demod_thread");
-    set_rt_and_affinity();             
+    //set_rt_and_affinity();
+    set_rt_and_affinity_prio(37,2);             
     
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
     if (!c || !c->fifo_in || !c->pcm) return NULL;
@@ -1657,7 +1672,9 @@ static void read_audio_exact(alsa48k_source_t* mic, float* buf, size_t need)
 static void* tx_writer_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(), "tx_writer_thread");
-    set_rt_and_affinity();
+    //set_rt_and_affinity();
+    set_rt_and_affinity_prio(42,2);
+
 
     tx_writer_ctrl_st* ctrl = (tx_writer_ctrl_st*)arg;
     if (!ctrl || !ctrl->radio || !ctrl->radio->sys) return NULL;
@@ -2063,6 +2080,9 @@ static void nbfm_rx(sys_st *sys)
     pthread_join(demod_th, NULL);
     pthread_join(rx_th, NULL);
     pthread_join(aw_th, NULL);
+
+    free(rx.rx_buffer);
+    rx.rx_buffer = NULL;
 
     // ping: quick ping of 2.475 kHz tone to signal audio path is closing
     // int16_t ping[12000]; // 0.25s @ 48k
@@ -2628,13 +2648,22 @@ void monitor_modem_status(sys_st *sys)
 		
 		if(key == 't') // Press 't' to toggle TX state and RFFE
 		{
-			if (nbfm_rx_active) 
-			{
-				nbfm_rx_active = false;
-				HW_LOCK();
-				cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);	
-			    HW_UNLOCK();
-			}
+			// if (nbfm_rx_active) 
+			// {
+			// 	nbfm_rx_active = false;
+			// 	HW_LOCK();
+			// 	cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);	
+			//     HW_UNLOCK();
+			// }
+            if (nbfm_rx_active) {
+                nbfm_rx_active = false;
+                HW_LOCK();
+                // Force the DMA/driver to IDLE before changing direction
+                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // IDLE
+                cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
+                HW_UNLOCK();
+                usleep(2000); // small settle
+            }
 			
 			if (!nbfm_tx_active)
 			{
@@ -2642,7 +2671,10 @@ void monitor_modem_status(sys_st *sys)
 				caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_tx_lowpass);
 				//caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_tx_hipass);
                 cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
-				caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)3); // TX
+                // a short sleep so that the tx_fifo gets filled already
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 30*1000*1000 }; // 30 ms
+                nanosleep(&ts, NULL);
+                caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)3); // TX
 				HW_UNLOCK();
 
 				__sync_synchronize();          // memory barrier
@@ -2701,53 +2733,49 @@ void monitor_modem_status(sys_st *sys)
 
 	}
     
-	nbfm_tx_active = false;
-	nbfm_rx_active = false;
-	smi_idle(sys);  // force driver to IDLE (unblocks reads/writes if they’re waiting)
-
-	HW_LOCK();
+    smi_idle(sys);  // force driver to IDLE (unblocks reads/writes if they’re waiting)
+    
+    HW_LOCK();
     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
     HW_UNLOCK();
     usleep(30 * 1000);
 
-	tx_ctrl.active = false;
-	dsp_ctrl.active = false;
-	rx_ctrl.active = false;
-	rf10_fifo_stop(&txq);
-
-	pthread_cancel(rx_thread);
-    pthread_cancel(tx_thread);
-    pthread_cancel(dsp_thread);
-    
-	pthread_join(tx_thread, NULL);
-	pthread_join(dsp_thread, NULL);
-	pthread_join(rx_thread, NULL);
-
-	rf10_fifo_destroy(&txq);
-
-	
+    // tx stopping
+	nbfm_tx_active = false;
+    tx_ctrl.active = false;
+    dsp_ctrl.active = false;
+    rf10_fifo_stop(&txq);
+    pthread_join(tx_thread, NULL);
+    pthread_join(dsp_thread, NULL);
+    rf10_fifo_destroy(&txq);
     if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
     if (tx_ctrl.a48k) free(tx_ctrl.a48k);
     if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
     if (tx_ctrl.mic)  alsa48k_destroy(tx_ctrl.mic);
 
-
-    // Stop RX audio path cleanly
+    // rx stopping
+	nbfm_rx_active = false;
+	rx_ctrl.active = false;
     dm.active = false;
     aw.active = false;
     rf10_fifo_stop(&rxq);
     aud10_fifo_stop(&afifo);
-
-    pthread_cancel(demod_th);
-    pthread_cancel(aw_th);
     pthread_join(demod_th, NULL);
     pthread_join(aw_th, NULL);
-
-    aud10_fifo_destroy(&afifo);
+    pthread_join(rx_thread, NULL);
     rf10_fifo_destroy(&rxq);
+    aud10_fifo_destroy(&afifo);
+    
     if (dm.pcm) snd_pcm_close(dm.pcm);
 
+	// pthread_cancel(tx_thread);
+    // pthread_cancel(rx_thread);
+    // pthread_cancel(dsp_thread);
+    // pthread_cancel(demod_th);
+    // pthread_cancel(aw_th);
+    
+	
     printw("Monitoring stopped.\n");
 	//refresh();
 	endwin(); // End ncurses mode
