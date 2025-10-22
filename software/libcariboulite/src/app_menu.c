@@ -106,6 +106,13 @@ static void nbfm_rx(sys_st *sys);
 static void nbfm_modem_selftest(sys_st *sys);
 static void monitor_modem_status(sys_st *sys);
 
+// --- forward declarations for pthread entry points ---
+static void* dsp_producer_thread_func(void* arg);
+static void* tx_writer_thread_func(void* arg);
+static void* rx_reader_thread_func(void* arg);
+static void* nbfm_demod_thread(void* arg);
+static void* audio_writer_thread(void* arg);
+
 //=================================================
 app_menu_item_st handles[] =
 {
@@ -1079,6 +1086,103 @@ struct rf10_fifo_s {
 	size_t drops, puts, gets, timeouts_put, timeouts_get;
 };
 
+typedef struct {
+    bool                active;
+    tx_writer_ctrl_st*  tx;      // reuse your modulator/mic/tone fields
+    rf10_fifo_t*        fifo;
+} dsp_producer_ctrl_t;
+
+// -------------------- PIPELINE PARAMS --------------------
+typedef struct {
+    // Radio
+    double freq_hz;             // e.g., 430.1e6
+    int    tx_power_dbm;        // e.g., -3
+
+    // Baseband source for NBFM mod
+    bool   tone_mode;           // true => synth audio
+    float  tone_hz;             // default 600.0f
+    float  tone_amp;            // 0..1 (e.g., 0.4f)
+    const char* mic_dev;        // ALSA capture device or NULL for no mic
+
+    // NBFM modulator config (kept same as your current)
+    float  out_scale;           // e.g., 4000.0f
+    float  f_dev_hz;            // e.g., 2500.0f
+} tx_params_t;
+
+typedef struct {
+    // Radio
+    double freq_hz;             // e.g., 430.1e6
+
+    // Demod/audio
+    const char* pcm_dev;        // ALSA playback device ("plughw:3,0" etc.)
+    float  deemph_tau_s;        // 50e-6 (EU) or 75e-6 (NA)
+    float  pcm_gain;            // e.g., 8000.0f
+
+    // Fixed rates
+    float  fs_rf;               // 4e6
+    float  fs_audio;            // 48e3
+} rx_params_t;
+
+
+// -------------------- PIPELINE HANDLES --------------------
+typedef struct {
+    // Allocated/owned objects
+    rf10_fifo_t         txq;
+    tx_writer_ctrl_st   tx_ctrl;
+    dsp_producer_ctrl_t dsp_ctrl;
+
+    // Threads
+    pthread_t           dsp_thread;
+    pthread_t           tx_thread;
+
+    // State
+    bool inited;
+    bool running;
+
+    // Binding
+    sys_st*                         sys;
+    cariboulite_radio_state_st*     radio;
+} tx_pipeline_t;
+
+typedef struct {
+    // Allocated/owned objects
+    rf10_fifo_t          rxq;       // IQ@4M → 10ms frames
+    aud10_fifo_t         afifo;     // 10ms PCM for ALSA
+    rx_reader_ctrl_st    rx_ctrl;
+    nbfm_demod_ctrl_t    demod;
+    audio_writer_ctrl_t  aw;
+
+    // Threads
+    pthread_t            rx_thread;
+    pthread_t            demod_thread;
+    pthread_t            aw_thread;
+
+    // State
+    bool inited;
+    bool running;
+
+    // Binding
+    sys_st*                         sys;
+    cariboulite_radio_state_st*     radio;
+} rx_pipeline_t;
+
+
+// -------------------- PIPELINE APIS (TX) --------------------
+int  tx_pipeline_init   (tx_pipeline_t* p, sys_st* sys,
+                         cariboulite_radio_state_st* radio,
+                         const tx_params_t* par);
+int  tx_pipeline_start  (tx_pipeline_t* p);
+void tx_pipeline_stop   (tx_pipeline_t* p);
+void tx_pipeline_destroy(tx_pipeline_t* p);
+
+// -------------------- PIPELINE APIS (RX) --------------------
+int  rx_pipeline_init   (rx_pipeline_t* p, sys_st* sys,
+                         cariboulite_radio_state_st* radio,
+                         const rx_params_t* par);
+int  rx_pipeline_start  (rx_pipeline_t* p);
+void rx_pipeline_stop   (rx_pipeline_t* p);
+void rx_pipeline_destroy(rx_pipeline_t* p);
+
 static void rf10_fifo_init(rf10_fifo_t* f, size_t cap, bool drop_oldest)
 {
     memset(f, 0, sizeof(*f));
@@ -1211,12 +1315,6 @@ static void rf10_fifo_stop(rf10_fifo_t* f)
     pthread_cond_broadcast(&f->can_get);
     pthread_mutex_unlock(&f->m);
 }
-
-typedef struct {
-    bool                active;
-    tx_writer_ctrl_st*  tx;      // reuse your modulator/mic/tone fields
-    rf10_fifo_t*        fifo;
-} dsp_producer_ctrl_t;
 
 // must be visible before any thread uses them
 static cariboulite_sample_complex_int16 latest_rx_sample = (cariboulite_sample_complex_int16){0};
@@ -1466,6 +1564,295 @@ fail:
     snd_pcm_hw_params_free(hw);
     snd_pcm_close(pcm);
     return -1;
+}
+
+// ========================= TX PIPELINE =========================
+int tx_pipeline_init(tx_pipeline_t* p, sys_st* sys,
+                     cariboulite_radio_state_st* radio,
+                     const tx_params_t* par)
+{
+    if (!p || !sys || !radio || !par) return -1;
+    memset(p, 0, sizeof(*p));
+    p->sys   = sys;
+    p->radio = radio;
+
+    // FIFOs
+    rf10_fifo_init(&p->txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
+
+    // tx_ctrl wiring (reuse your structures/threads)
+    p->tx_ctrl.active         = true;
+    p->tx_ctrl.radio          = radio;
+    p->tx_ctrl.fifo           = &p->txq;
+    p->tx_ctrl.live_from_mic  = (par->mic_dev && *par->mic_dev);
+    p->tx_ctrl.mic            = NULL;            // (open later if needed)
+    p->tx_ctrl.tone_mode      = par->tone_mode;
+    p->tx_ctrl.tone_hz        = par->tone_hz;
+    p->tx_ctrl.tone_amp       = par->tone_amp;
+    p->tx_ctrl.tone_phase     = 0.0f;
+    p->tx_ctrl.fm             = NULL;
+    p->tx_ctrl.a48k           = NULL;
+    p->tx_ctrl.iq4m           = NULL;
+
+    // NBFM mod init
+    nbfm4m_cfg_t cfg = {
+        .audio_fs      = 48000.0,
+        .rf_fs         = 4000000.0,
+        .f_dev_hz      = par->f_dev_hz,     // 2500.0
+        .preemph_tau_s = 0.0,
+        .out_scale     = par->out_scale,    // 4000.0
+        .linear_interp = 1,
+    };
+    p->tx_ctrl.fm   = nbfm4m_create(&cfg);
+    p->tx_ctrl.a48k = (float*) calloc(480,    sizeof(float));
+    p->tx_ctrl.iq4m = (iq16_t*)calloc(40000,  sizeof(iq16_t));
+    if (!p->tx_ctrl.fm || !p->tx_ctrl.a48k || !p->tx_ctrl.iq4m) {
+        if (p->tx_ctrl.fm)   nbfm4m_destroy(p->tx_ctrl.fm);
+        if (p->tx_ctrl.a48k) free(p->tx_ctrl.a48k);
+        if (p->tx_ctrl.iq4m) free(p->tx_ctrl.iq4m);
+        rf10_fifo_destroy(&p->txq);
+        return -2;
+    }
+
+    // Optional mic
+    if (p->tx_ctrl.live_from_mic) {
+        p->tx_ctrl.mic = alsa48k_create(par->mic_dev, 1.0f);
+        if (!p->tx_ctrl.mic) {
+            // mic failed — fall back to tone
+            p->tx_ctrl.live_from_mic = false;
+            p->tx_ctrl.tone_mode     = true;
+        }
+    }
+
+    // Radio basic set
+    HW_LOCK();
+    cariboulite_radio_set_frequency(radio, true, (double*)&par->freq_hz);
+    cariboulite_radio_set_tx_power (radio, par->tx_power_dbm);
+    HW_UNLOCK();
+
+    // Prepare DSP/Writer threads (running idle until .start)
+    p->dsp_ctrl.active = true;
+    p->dsp_ctrl.tx     = &p->tx_ctrl;
+    p->dsp_ctrl.fifo   = &p->txq;
+    if (pthread_create(&p->dsp_thread, NULL, dsp_producer_thread_func, &p->dsp_ctrl) != 0)
+        return -3;
+
+    if (pthread_create(&p->tx_thread,  NULL, tx_writer_thread_func,    &p->tx_ctrl) != 0)
+        return -4;
+
+    p->inited = true;
+    p->running = false;
+    return 0;
+}
+
+int tx_pipeline_start(tx_pipeline_t* p)
+{
+    if (!p || !p->inited || p->running) return -1;
+
+    // Disable RX if it was on and arm TX chain
+    if (nbfm_rx_active) {
+        nbfm_rx_active = false;
+        HW_LOCK();
+        cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_rx, false);
+        HW_UNLOCK();
+        usleep(2000);
+    }
+
+    HW_LOCK();
+    caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_tx_lowpass);
+    cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_tx, true);
+    // give writer a head-start so FIFO fills a bit
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 30*1000*1000 };
+    nanosleep(&ts, NULL);
+    caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)3); // TX
+    HW_UNLOCK();
+
+    __sync_synchronize();
+    nbfm_tx_active = true;
+
+    p->running = true;
+    return 0;
+}
+
+void tx_pipeline_stop(tx_pipeline_t* p)
+{
+    if (!p || !p->inited || !p->running) return;
+
+    nbfm_tx_active = false;
+    __sync_synchronize();
+
+    HW_LOCK();
+    caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)0); // idle
+    cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_tx, false);
+    caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
+    HW_UNLOCK();
+
+    p->running = false;
+}
+
+void tx_pipeline_destroy(tx_pipeline_t* p)
+{
+    if (!p || !p->inited) return;
+
+    tx_pipeline_stop(p);
+
+    // stop threads and free
+    p->tx_ctrl.active  = false;
+    p->dsp_ctrl.active = false;
+    rf10_fifo_stop(&p->txq);
+
+    pthread_cancel(p->tx_thread);
+    pthread_cancel(p->dsp_thread);
+    pthread_join(p->tx_thread, NULL);
+    pthread_join(p->dsp_thread, NULL);
+
+    rf10_fifo_destroy(&p->txq);
+
+    if (p->tx_ctrl.iq4m) free(p->tx_ctrl.iq4m);
+    if (p->tx_ctrl.a48k) free(p->tx_ctrl.a48k);
+    if (p->tx_ctrl.fm)   nbfm4m_destroy(p->tx_ctrl.fm);
+    if (p->tx_ctrl.mic)  alsa48k_destroy(p->tx_ctrl.mic);
+
+    p->inited = false;
+}
+
+// ========================= RX PIPELINE =========================
+int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
+                     cariboulite_radio_state_st* radio,
+                     const rx_params_t* par)
+{
+    if (!p || !sys || !radio || !par) return -1;
+    memset(p, 0, sizeof(*p));
+    p->sys   = sys;
+    p->radio = radio;
+
+    // FIFOs
+    rf10_fifo_init(&p->rxq,  /*cap=*/64, /*drop_oldest_on_full=*/true);
+    aud10_fifo_init(&p->afifo, /*cap=*/64);
+
+    // Open ALSA playback
+    unsigned rate=0, channels=0;
+    if (alsa_open_playback(&p->demod.pcm, par->pcm_dev, &rate, &channels) != 0) {
+        aud10_fifo_destroy(&p->afifo);
+        rf10_fifo_destroy(&p->rxq);
+        return -2;
+    }
+    alsa_tune_sw(p->demod.pcm);
+
+    // Audio writer
+    p->aw.active   = true;
+    p->aw.pcm      = p->demod.pcm;
+    p->aw.channels = channels ? channels : 1;
+    p->aw.fifo     = &p->afifo;
+    if (pthread_create(&p->aw_thread, NULL, audio_writer_thread, &p->aw) != 0)
+        return -3;
+
+    // Demod setup
+    p->demod.active          = true;
+    p->demod.fifo_in         = &p->rxq;
+    p->demod.afifo_out       = &p->afifo;
+    p->demod.fs_rf           = par->fs_rf;      // 4e6
+    p->demod.fs_audio        = par->fs_audio;   // 48e3
+    p->demod.deemph_tau      = par->deemph_tau_s;
+    p->demod.pcm_gain        = par->pcm_gain;
+    p->demod.pcm_total_frames= 0;
+    p->demod.pcm_channels    = p->aw.channels;
+
+    if (pthread_create(&p->demod_thread, NULL, nbfm_demod_thread, &p->demod) != 0)
+        return -4;
+
+    // Reader (4MS/s into 10ms frames)
+    p->rx_ctrl.active        = true;
+    p->rx_ctrl.radio         = radio;
+    p->rx_ctrl.rx_buffer     = malloc(sizeof(cariboulite_sample_complex_int16) * 40000);
+    p->rx_ctrl.rx_buffer_size= 40000;
+    p->rx_ctrl.rx_fifo       = &p->rxq;
+    if (!p->rx_ctrl.rx_buffer) return -5;
+
+    if (pthread_create(&p->rx_thread, NULL, rx_reader_thread_func, &p->rx_ctrl) != 0)
+        return -6;
+
+    // Set radio frequency
+    HW_LOCK();
+    cariboulite_radio_set_frequency(radio, true, (double*)&par->freq_hz);
+    HW_UNLOCK();
+
+    p->inited = true;
+    p->running = false;
+    return 0;
+}
+
+int rx_pipeline_start(rx_pipeline_t* p)
+{
+    if (!p || !p->inited || p->running) return -1;
+
+    // Stop TX if needed
+    if (nbfm_tx_active) {
+        nbfm_tx_active = false;
+        __sync_synchronize();
+        HW_LOCK();
+        caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)0);
+        cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_tx, false);
+        caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
+        HW_UNLOCK();
+    }
+
+    HW_LOCK();
+    caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_rx_lowpass);
+    cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_rx, true);
+    caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)1); // RX on S1G
+    HW_UNLOCK();
+
+    __sync_synchronize();
+    nbfm_rx_active = true;
+
+    p->running = true;
+    return 0;
+}
+
+void rx_pipeline_stop(rx_pipeline_t* p)
+{
+    if (!p || !p->inited || !p->running) return;
+
+    nbfm_rx_active = false;
+    __sync_synchronize();
+
+    HW_LOCK();
+    cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_rx, false);
+    caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)0);
+    caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
+    HW_UNLOCK();
+
+    p->running = false;
+}
+
+void rx_pipeline_destroy(rx_pipeline_t* p)
+{
+    if (!p || !p->inited) return;
+
+    rx_pipeline_stop(p);
+
+    // stop threads and free
+    p->rx_ctrl.active = false;
+    p->demod.active   = false;
+    p->aw.active      = false;
+    rf10_fifo_stop(&p->rxq);
+    aud10_fifo_stop(&p->afifo);
+
+    pthread_cancel(p->rx_thread);
+    pthread_cancel(p->demod_thread);
+    pthread_cancel(p->aw_thread);
+    pthread_join(p->rx_thread, NULL);
+    pthread_join(p->demod_thread, NULL);
+    pthread_join(p->aw_thread, NULL);
+
+    if (p->rx_ctrl.rx_buffer) free(p->rx_ctrl.rx_buffer);
+    p->rx_ctrl.rx_buffer = NULL;
+
+    if (p->demod.pcm) snd_pcm_close(p->demod.pcm);
+    aud10_fifo_destroy(&p->afifo);
+    rf10_fifo_destroy(&p->rxq);
+
+    p->inited = false;
 }
 
 // --- simple 1st-order de-emphasis (continuous-time tau) at fs samples/s
@@ -1768,125 +2155,191 @@ static void* tx_writer_thread_func(void* arg)
     return NULL;
 }
 
+// static void nbfm_tx_tone(sys_st *sys)
+// {
+//     // mirror monitor_modem_status() semantics, but without ncurses/instrumentation
+//     nbfm_tx_active = false;
+//     nbfm_rx_active = false;
+
+//     double frequency = 430100000;   // Hz
+//     int    tx_power  = -3;          // dBm
+
+//     // --- TX buffers & control blocks (TX only; no RX thread here) ---
+//     const int iq_tx_buffer_size = (1u << 18);
+//     cariboulite_sample_complex_int16 iq_tx_buffer[iq_tx_buffer_size];
+
+//     cariboulite_radio_state_st *radio = &sys->radio_low;
+
+//     // FIFO for 10ms frames
+//     rf10_fifo_t txq;
+//     rf10_fifo_init(&txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
+
+//     tx_writer_ctrl_st tx_ctrl = {
+//         .active        = true,
+//         .radio         = radio,
+//         .tx_buffer     = iq_tx_buffer,
+//         .tx_buffer_size= iq_tx_buffer_size,
+//         .live_from_mic = false,
+//         .mic           = NULL,
+//         .tone_mode     = true,
+//         .tone_hz       = 600.0f,
+//         .tone_amp      = 0.4f,
+//         .tone_phase    = 0.0f,
+//         .fifo          = &txq,
+//         .fm            = NULL,
+//         .a48k          = NULL,
+//         .iq4m          = NULL,
+//     };
+
+//     // Modulator & scratch (same config as monitor_modem_status)
+//     nbfm4m_cfg_t cfg = {
+//         .audio_fs      = 48000.0,
+//         .rf_fs         = 4000000.0,
+//         .f_dev_hz      = 2500.0,
+//         .preemph_tau_s = 0.0,
+//         .out_scale     = 4000.0f,
+//         .linear_interp = 1,
+//     };
+//     tx_ctrl.fm   = nbfm4m_create(&cfg);
+//     tx_ctrl.a48k = (float*)calloc(480,    sizeof(float));
+//     tx_ctrl.iq4m = (iq16_t*)calloc(40000, sizeof(iq16_t));
+
+//     if (!tx_ctrl.fm || !tx_ctrl.a48k || !tx_ctrl.iq4m) {
+//         fprintf(stderr, "[nbfm_tx_tone] init failed (fm=%p a48k=%p iq4m=%p)\n",
+//                 (void*)tx_ctrl.fm, (void*)tx_ctrl.a48k, (void*)tx_ctrl.iq4m);
+//         if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
+//         if (tx_ctrl.a48k) free(tx_ctrl.a48k);
+//         if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
+//         rf10_fifo_destroy(&txq);
+//         return;
+//     }
+
+//     // Start DSP producer + TX writer threads (same as monitor_)
+//     pthread_t dsp_thread, tx_thread;
+
+//     dsp_producer_ctrl_t dsp_ctrl = {
+//         .active = true,
+//         .tx     = &tx_ctrl,
+//         .fifo   = &txq,
+//     };
+//     pthread_create(&dsp_thread, NULL, dsp_producer_thread_func, &dsp_ctrl);
+//     pthread_create(&tx_thread,  NULL, tx_writer_thread_func,    &tx_ctrl);
+
+//     // Radio base config
+//     HW_LOCK();
+//     cariboulite_radio_set_frequency(radio, true, &frequency);
+//     cariboulite_radio_set_tx_power(radio, tx_power);
+//     HW_UNLOCK();
+//     radio->tx_loopback_anabled   = false;
+//     radio->tx_control_with_iq_if = true;
+
+//     // --- Minimal CLI: 1 = toggle TX, 99 = exit ---
+//     for (;;) {
+//         int choice = -1;
+// 		printf("TX frequency: %.0f Hz\n",round(frequency/1000)*1000);
+// 		printf("TX power: %d dBm\n",tx_power);
+//         printf(" [ 1] Toggle NBFM TX\n"); 
+// 		printf(" [99] Return to main menu\n");
+//         printf(" Choice: ");
+//         if (scanf("%d", &choice) != 1) {
+//             // flush junk on input error
+//             int c; while ((c = getchar()) != '\n' && c != EOF) {}
+//             continue;
+//         }
+
+//         if (choice == 1) {
+//             // exactly like 't' path in monitor_modem_status()
+//             if (!nbfm_tx_active) {
+//                 if (nbfm_rx_active) {
+//                     nbfm_rx_active = false;
+//                     HW_LOCK();
+//                     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
+//                     HW_UNLOCK();
+//                 }
+//                 HW_LOCK();
+//                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_tx_lowpass);
+//                 cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
+//                 caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)3); // TX
+//                 HW_UNLOCK();
+
+//                 __sync_synchronize();   // memory barrier
+//                 nbfm_tx_active = true;  // tell writer LAST
+//                 printf("TX: ON\n");
+//             } else {
+//                 nbfm_tx_active = false;
+//                 __sync_synchronize();
+
+//                 HW_LOCK();
+//                 caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
+//                 cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+//                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
+//                 HW_UNLOCK();
+//                 printf("TX: OFF\n");
+//             }
+//         } else if (choice == 99) {
+//             break;
+//         }
+//     }
+
+//     // --- Teardown (same order/pattern as monitor_modem_status) ---
+//     nbfm_tx_active = false;
+//     nbfm_rx_active = false;
+//     smi_idle(sys);
+
+//     HW_LOCK();
+//     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+//     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
+//     HW_UNLOCK();
+//     usleep(30 * 1000);
+
+//     tx_ctrl.active  = false;
+//     dsp_ctrl.active = false;
+//     rf10_fifo_stop(&txq);
+
+//     pthread_cancel(tx_thread);
+//     pthread_cancel(dsp_thread);
+//     pthread_join(tx_thread, NULL);
+//     pthread_join(dsp_thread, NULL);
+
+//     rf10_fifo_destroy(&txq);
+
+//     if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
+//     if (tx_ctrl.a48k) free(tx_ctrl.a48k);
+//     if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
+
+//     printf("NBFM TX tone stopped.\n");
+// }
+
 static void nbfm_tx_tone(sys_st *sys)
 {
-    // mirror monitor_modem_status() semantics, but without ncurses/instrumentation
-    nbfm_tx_active = false;
-    nbfm_rx_active = false;
-
-    double frequency = 430100000;   // Hz
-    int    tx_power  = -3;          // dBm
-
-    // --- TX buffers & control blocks (TX only; no RX thread here) ---
-    const int iq_tx_buffer_size = (1u << 18);
-    cariboulite_sample_complex_int16 iq_tx_buffer[iq_tx_buffer_size];
-
-    cariboulite_radio_state_st *radio = &sys->radio_low;
-
-    // FIFO for 10ms frames
-    rf10_fifo_t txq;
-    rf10_fifo_init(&txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
-
-    tx_writer_ctrl_st tx_ctrl = {
-        .active        = true,
-        .radio         = radio,
-        .tx_buffer     = iq_tx_buffer,
-        .tx_buffer_size= iq_tx_buffer_size,
-        .live_from_mic = false,
-        .mic           = NULL,
-        .tone_mode     = true,
-        .tone_hz       = 600.0f,
-        .tone_amp      = 0.4f,
-        .tone_phase    = 0.0f,
-        .fifo          = &txq,
-        .fm            = NULL,
-        .a48k          = NULL,
-        .iq4m          = NULL,
+    tx_pipeline_t tx = {0};
+    tx_params_t par = {
+        .freq_hz      = 430100000.0,
+        .tx_power_dbm = -3,
+        .tone_mode    = true,
+        .tone_hz      = 600.0f,
+        .tone_amp     = 0.4f,
+        .mic_dev      = NULL,
+        .out_scale    = 4000.0f,
+        .f_dev_hz     = 2500.0f,
     };
 
-    // Modulator & scratch (same config as monitor_modem_status)
-    nbfm4m_cfg_t cfg = {
-        .audio_fs      = 48000.0,
-        .rf_fs         = 4000000.0,
-        .f_dev_hz      = 2500.0,
-        .preemph_tau_s = 0.0,
-        .out_scale     = 4000.0f,
-        .linear_interp = 1,
-    };
-    tx_ctrl.fm   = nbfm4m_create(&cfg);
-    tx_ctrl.a48k = (float*)calloc(480,    sizeof(float));
-    tx_ctrl.iq4m = (iq16_t*)calloc(40000, sizeof(iq16_t));
-
-    if (!tx_ctrl.fm || !tx_ctrl.a48k || !tx_ctrl.iq4m) {
-        fprintf(stderr, "[nbfm_tx_tone] init failed (fm=%p a48k=%p iq4m=%p)\n",
-                (void*)tx_ctrl.fm, (void*)tx_ctrl.a48k, (void*)tx_ctrl.iq4m);
-        if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
-        if (tx_ctrl.a48k) free(tx_ctrl.a48k);
-        if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
-        rf10_fifo_destroy(&txq);
+    if (tx_pipeline_init(&tx, sys, &sys->radio_low, &par) != 0) {
+        fprintf(stderr, "[tx_tone] init failed\n");
         return;
     }
 
-    // Start DSP producer + TX writer threads (same as monitor_)
-    pthread_t dsp_thread, tx_thread;
-
-    dsp_producer_ctrl_t dsp_ctrl = {
-        .active = true,
-        .tx     = &tx_ctrl,
-        .fifo   = &txq,
-    };
-    pthread_create(&dsp_thread, NULL, dsp_producer_thread_func, &dsp_ctrl);
-    pthread_create(&tx_thread,  NULL, tx_writer_thread_func,    &tx_ctrl);
-
-    // Radio base config
-    HW_LOCK();
-    cariboulite_radio_set_frequency(radio, true, &frequency);
-    cariboulite_radio_set_tx_power(radio, tx_power);
-    HW_UNLOCK();
-    radio->tx_loopback_anabled   = false;
-    radio->tx_control_with_iq_if = true;
-
-    // --- Minimal CLI: 1 = toggle TX, 99 = exit ---
     for (;;) {
         int choice = -1;
-		printf("TX frequency: %.0f Hz\n",round(frequency/1000)*1000);
-		printf("TX power: %d dBm\n",tx_power);
-        printf(" [ 1] Toggle NBFM TX\n"); 
-		printf(" [99] Return to main menu\n");
+        printf("TX freq: %.0f Hz  power: %d dBm\n", par.freq_hz, par.tx_power_dbm);
+        printf(" [1] Toggle NBFM TX   [99] Return\n");
         printf(" Choice: ");
-        if (scanf("%d", &choice) != 1) {
-            // flush junk on input error
-            int c; while ((c = getchar()) != '\n' && c != EOF) {}
-            continue;
-        }
-
+        if (scanf("%d", &choice) != 1) continue;
         if (choice == 1) {
-            // exactly like 't' path in monitor_modem_status()
-            if (!nbfm_tx_active) {
-                if (nbfm_rx_active) {
-                    nbfm_rx_active = false;
-                    HW_LOCK();
-                    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-                    HW_UNLOCK();
-                }
-                HW_LOCK();
-                caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_tx_lowpass);
-                cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
-                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)3); // TX
-                HW_UNLOCK();
-
-                __sync_synchronize();   // memory barrier
-                nbfm_tx_active = true;  // tell writer LAST
-                printf("TX: ON\n");
+            if (!tx.running) {
+                if (tx_pipeline_start(&tx) == 0) printf("TX: ON\n");
             } else {
-                nbfm_tx_active = false;
-                __sync_synchronize();
-
-                HW_LOCK();
-                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
-                cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-                caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
-                HW_UNLOCK();
+                tx_pipeline_stop(&tx);
                 printf("TX: OFF\n");
             }
         } else if (choice == 99) {
@@ -1894,164 +2347,218 @@ static void nbfm_tx_tone(sys_st *sys)
         }
     }
 
-    // --- Teardown (same order/pattern as monitor_modem_status) ---
-    nbfm_tx_active = false;
-    nbfm_rx_active = false;
-    smi_idle(sys);
-
-    HW_LOCK();
-    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-    HW_UNLOCK();
-    usleep(30 * 1000);
-
-    tx_ctrl.active  = false;
-    dsp_ctrl.active = false;
-    rf10_fifo_stop(&txq);
-
-    pthread_cancel(tx_thread);
-    pthread_cancel(dsp_thread);
-    pthread_join(tx_thread, NULL);
-    pthread_join(dsp_thread, NULL);
-
-    rf10_fifo_destroy(&txq);
-
-    if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
-    if (tx_ctrl.a48k) free(tx_ctrl.a48k);
-    if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
-
+    tx_pipeline_destroy(&tx);
     printf("NBFM TX tone stopped.\n");
 }
 
+// static void nbfm_rx(sys_st *sys)
+// {
+//     // mirror monitor_modem_status() semantics, but without ncurses/instrumentation
+//     nbfm_tx_active = false;
+//     nbfm_rx_active = false;
+
+//     double frequency = 430100000;   // Hz
+
+//     cariboulite_radio_state_st *radio = &sys->radio_low;
+
+//     // FIFO for 10ms frames
+//     rf10_fifo_t rxq;
+//     rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/true);
+
+//     // RX reader
+// 	rx_reader_ctrl_st rx = {
+// 		.active = true,
+// 		.radio  = &sys->radio_low,
+// 		.rx_buffer = malloc(sizeof(cariboulite_sample_complex_int16) * 40000),
+// 		.rx_buffer_size = 40000,
+// 		.rx_fifo = &rxq,                         // <-- add this field
+// 	};
+// 	pthread_t rx_th;
+// 	pthread_create(&rx_th, NULL, rx_reader_thread_func, &rx);
+
+//     // Demod
+// 	nbfm_demod_ctrl_t dm = {
+// 		.active = true,
+// 		.fifo_in = &rxq,
+// 		.deemph_tau = 50e-6f,        // or 50e-6f
+//         .fs_rf = 4000000.0f,
+// 		.fs_audio = 48000.0f,
+// 		.deemph_y = 0.0f,
+// 		.last_i = 0, .last_q = 0,
+// 		.pcm = NULL,
+//         .pcm_rate = 0,
+//         .pcm_channels = 0,
+//         .pcm_gain = 8000.0f,          // <-- boost a bit so you *hear* it
+//         .pcm_total_frames = 0,
+//     };
+
+//     // --- create audio FIFO + writer
+//     aud10_fifo_t afifo;
+//     aud10_fifo_init(&afifo, /*cap=*/64); // ~640 ms cushion
+
+//     // open with channel detection
+//     if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
+//         fprintf(stderr, "[nbfm_rx] alsa_open_playback failed\n");
+//         return;
+//     }
+    
+//     alsa_tune_sw(dm.pcm);
+    
+//     // ping: quick ping of 2.525 kHz quidar tone to verify audio path is working
+//     int16_t ping[12000]; // 0.25s @ 48k
+//     for (int i = 0; i < 12000; i++) {
+//         float x = sinf(2.f * M_PI * 2525.f * (float)i / 48000.f);
+//         ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
+//     }
+//     write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/dm.pcm_channels);  // same as speaker-test
+    
+
+//     audio_writer_ctrl_t aw = {
+//         .active   = true,
+//         .pcm      = dm.pcm,
+//         .channels = dm.pcm_channels,
+//         .fifo     = &afifo,
+//         .xruns    = 0,
+//     };
+//     pthread_t aw_th;
+//     pthread_create(&aw_th, NULL, audio_writer_thread, &aw);
+
+//     // pass to demod
+//     dm.afifo_out = &afifo;
+    
+//     for (int i = 0; i < 8; i++) {         // ~80 ms cushion
+//     aud10_frame_t z = {0};
+//     aud10_fifo_put(&afifo, &z, -1);
+// }
+
+//     pthread_t demod_th;
+// 	pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
+
+
+//     // Radio base config
+//     HW_LOCK();
+//     cariboulite_radio_set_frequency(&sys->radio_low, true, &frequency);
+//     HW_UNLOCK();
+    
+//     // --- Minimal CLI: 1 = toggle TX, 99 = exit ---
+//     for (;;) {
+//         int choice = -1;
+// 		printf("TX frequency: %.0f Hz\n",round(frequency/1000)*1000);
+//         printf(" [ 1] Toggle NBFM RX\n"); 
+// 		printf(" [99] Return to main menu\n");
+//         printf(" Choice: ");
+//         if (scanf("%d", &choice) != 1) {
+//             // flush junk on input error
+//             int c; while ((c = getchar()) != '\n' && c != EOF) {}
+//             continue;
+//         }
+
+//         if (choice == 1) {
+//             // exactly like 't' path in monitor_modem_status()
+//             if (!nbfm_rx_active) {
+//                 if (nbfm_tx_active) {
+//                     nbfm_tx_active = false;
+//                     HW_LOCK();
+//                     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+//                     HW_UNLOCK();
+//                 }
+//                 HW_LOCK();
+//                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_rx_lowpass);
+//                 cariboulite_radio_activate_channel(&sys->radio_low, cariboulite_channel_dir_rx, true);
+//                 caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)1); // RX S1G
+//                 HW_UNLOCK();
+
+//                 __sync_synchronize();   // memory barrier
+//                 nbfm_rx_active = true;  // tell reader LAST
+//                 printf("RX: ON\n");
+//             } else {
+//                 nbfm_rx_active = false;
+//                 __sync_synchronize();
+
+//                 HW_LOCK();
+//                 caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
+//                 cariboulite_radio_activate_channel(&sys->radio_low, cariboulite_channel_dir_rx, false);
+//                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
+//                 HW_UNLOCK();
+//                 printf("RX: OFF\n");
+//             }
+//         } else if (choice == 99) {
+//             break;
+//         }
+//     }
+
+//     // --- Teardown (same order/pattern as monitor_modem_status) ---
+// 	dm.active = false;
+//     aud10_fifo_stop(&afifo);
+//     aw.active = false;
+//     nbfm_rx_active = false;
+//     smi_idle(sys);
+
+//     HW_LOCK();
+//     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+//     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
+//     HW_UNLOCK();
+//     usleep(30 * 1000);
+
+   
+
+//     pthread_cancel(demod_th);
+//     pthread_cancel(rx_th);
+//     pthread_cancel(aw_th);
+//     pthread_join(demod_th, NULL);
+//     pthread_join(rx_th, NULL);
+//     pthread_join(aw_th, NULL);
+
+//     free(rx.rx_buffer);
+//     rx.rx_buffer = NULL;
+
+//     // ping: quick ping of 2.475 kHz tone to signal audio path is closing
+//     // int16_t ping[12000]; // 0.25s @ 48k
+//     for (int i = 0; i < 12000; i++) {
+//         float x = sinf(2.f * M_PI * 2475.f * (float)i / 48000.f);
+//         ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
+//     }
+//     write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/dm.pcm_channels);  // same as speaker-test
+//     usleep(250 * 1000);
+
+
+//     rf10_fifo_destroy(&rxq);
+//     aud10_fifo_destroy(&afifo);
+//     if (dm.pcm) snd_pcm_close(dm.pcm);
+
+    
+
+//     printf("NBFM RX stopped.\n");
+// }
+
 static void nbfm_rx(sys_st *sys)
 {
-    // mirror monitor_modem_status() semantics, but without ncurses/instrumentation
-    nbfm_tx_active = false;
-    nbfm_rx_active = false;
-
-    double frequency = 430100000;   // Hz
-
-    cariboulite_radio_state_st *radio = &sys->radio_low;
-
-    // FIFO for 10ms frames
-    rf10_fifo_t rxq;
-    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/true);
-
-    // RX reader
-	rx_reader_ctrl_st rx = {
-		.active = true,
-		.radio  = &sys->radio_low,
-		.rx_buffer = malloc(sizeof(cariboulite_sample_complex_int16) * 40000),
-		.rx_buffer_size = 40000,
-		.rx_fifo = &rxq,                         // <-- add this field
-	};
-	pthread_t rx_th;
-	pthread_create(&rx_th, NULL, rx_reader_thread_func, &rx);
-
-    // Demod
-	nbfm_demod_ctrl_t dm = {
-		.active = true,
-		.fifo_in = &rxq,
-		.deemph_tau = 50e-6f,        // or 50e-6f
-        .fs_rf = 4000000.0f,
-		.fs_audio = 48000.0f,
-		.deemph_y = 0.0f,
-		.last_i = 0, .last_q = 0,
-		.pcm = NULL,
-        .pcm_rate = 0,
-        .pcm_channels = 0,
-        .pcm_gain = 8000.0f,          // <-- boost a bit so you *hear* it
-        .pcm_total_frames = 0,
+    rx_pipeline_t rx = {0};
+    rx_params_t par = {
+        .freq_hz       = 430100000.0,
+        .pcm_dev       = "plughw:3,0",
+        .deemph_tau_s  = 50e-6f,
+        .pcm_gain      = 8000.0f,
+        .fs_rf         = 4000000.0f,
+        .fs_audio      = 48000.0f,
     };
 
-    // --- create audio FIFO + writer
-    aud10_fifo_t afifo;
-    aud10_fifo_init(&afifo, /*cap=*/64); // ~640 ms cushion
-
-    // open with channel detection
-    if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
-        fprintf(stderr, "[nbfm_rx] alsa_open_playback failed\n");
+    if (rx_pipeline_init(&rx, sys, &sys->radio_low, &par) != 0) {
+        fprintf(stderr, "[rx] init failed\n");
         return;
     }
-    
-    alsa_tune_sw(dm.pcm);
-    
-    // ping: quick ping of 2.525 kHz quidar tone to verify audio path is working
-    int16_t ping[12000]; // 0.25s @ 48k
-    for (int i = 0; i < 12000; i++) {
-        float x = sinf(2.f * M_PI * 2525.f * (float)i / 48000.f);
-        ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
-    }
-    write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/dm.pcm_channels);  // same as speaker-test
-    
 
-    audio_writer_ctrl_t aw = {
-        .active   = true,
-        .pcm      = dm.pcm,
-        .channels = dm.pcm_channels,
-        .fifo     = &afifo,
-        .xruns    = 0,
-    };
-    pthread_t aw_th;
-    pthread_create(&aw_th, NULL, audio_writer_thread, &aw);
-
-    // pass to demod
-    dm.afifo_out = &afifo;
-    
-    for (int i = 0; i < 8; i++) {         // ~80 ms cushion
-    aud10_frame_t z = {0};
-    aud10_fifo_put(&afifo, &z, -1);
-}
-
-    pthread_t demod_th;
-	pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
-
-
-    // Radio base config
-    HW_LOCK();
-    cariboulite_radio_set_frequency(&sys->radio_low, true, &frequency);
-    HW_UNLOCK();
-    
-    // --- Minimal CLI: 1 = toggle TX, 99 = exit ---
     for (;;) {
         int choice = -1;
-		printf("TX frequency: %.0f Hz\n",round(frequency/1000)*1000);
-        printf(" [ 1] Toggle NBFM RX\n"); 
-		printf(" [99] Return to main menu\n");
+        printf("RX freq: %.0f Hz\n", par.freq_hz);
+        printf(" [1] Toggle NBFM RX   [99] Return\n");
         printf(" Choice: ");
-        if (scanf("%d", &choice) != 1) {
-            // flush junk on input error
-            int c; while ((c = getchar()) != '\n' && c != EOF) {}
-            continue;
-        }
-
+        if (scanf("%d", &choice) != 1) continue;
         if (choice == 1) {
-            // exactly like 't' path in monitor_modem_status()
-            if (!nbfm_rx_active) {
-                if (nbfm_tx_active) {
-                    nbfm_tx_active = false;
-                    HW_LOCK();
-                    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-                    HW_UNLOCK();
-                }
-                HW_LOCK();
-                caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_rx_lowpass);
-                cariboulite_radio_activate_channel(&sys->radio_low, cariboulite_channel_dir_rx, true);
-                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)1); // RX S1G
-                HW_UNLOCK();
-
-                __sync_synchronize();   // memory barrier
-                nbfm_rx_active = true;  // tell reader LAST
-                printf("RX: ON\n");
+            if (!rx.running) {
+                if (rx_pipeline_start(&rx) == 0) printf("RX: ON\n");
             } else {
-                nbfm_rx_active = false;
-                __sync_synchronize();
-
-                HW_LOCK();
-                caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
-                cariboulite_radio_activate_channel(&sys->radio_low, cariboulite_channel_dir_rx, false);
-                caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
-                HW_UNLOCK();
+                rx_pipeline_stop(&rx);
                 printf("RX: OFF\n");
             }
         } else if (choice == 99) {
@@ -2059,47 +2566,7 @@ static void nbfm_rx(sys_st *sys)
         }
     }
 
-    // --- Teardown (same order/pattern as monitor_modem_status) ---
-	dm.active = false;
-    aud10_fifo_stop(&afifo);
-    aw.active = false;
-    nbfm_rx_active = false;
-    smi_idle(sys);
-
-    HW_LOCK();
-    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-    HW_UNLOCK();
-    usleep(30 * 1000);
-
-   
-
-    pthread_cancel(demod_th);
-    pthread_cancel(rx_th);
-    pthread_cancel(aw_th);
-    pthread_join(demod_th, NULL);
-    pthread_join(rx_th, NULL);
-    pthread_join(aw_th, NULL);
-
-    free(rx.rx_buffer);
-    rx.rx_buffer = NULL;
-
-    // ping: quick ping of 2.475 kHz tone to signal audio path is closing
-    // int16_t ping[12000]; // 0.25s @ 48k
-    for (int i = 0; i < 12000; i++) {
-        float x = sinf(2.f * M_PI * 2475.f * (float)i / 48000.f);
-        ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
-    }
-    write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/dm.pcm_channels);  // same as speaker-test
-    usleep(250 * 1000);
-
-
-    rf10_fifo_destroy(&rxq);
-    aud10_fifo_destroy(&afifo);
-    if (dm.pcm) snd_pcm_close(dm.pcm);
-
-    
-
+    rx_pipeline_destroy(&rx);
     printf("NBFM RX stopped.\n");
 }
 
