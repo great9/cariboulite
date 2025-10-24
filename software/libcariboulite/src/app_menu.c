@@ -1798,6 +1798,13 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
     // if (pthread_create(&p->rx_thread, NULL, rx_reader_thread_func, &p->rx_ctrl) != 0)
     //     return -6;
 
+    // Reader (prepare only — start later in rx_pipeline_start)
+    p->rx_ctrl.active         = false;
+    p->rx_ctrl.radio          = radio;
+    p->rx_ctrl.rx_buffer      = NULL;         // allocate on start
+    p->rx_ctrl.rx_buffer_size = 0;
+    p->rx_ctrl.rx_fifo        = &p->rxq;
+
     // Set radio frequency
     HW_LOCK();
     cariboulite_radio_set_frequency(radio, true, (double*)&par->freq_hz);
