@@ -147,14 +147,41 @@ static inline uint64_t mono_ns(void){
     return (uint64_t)ts.tv_sec*1000000000ull + ts.tv_nsec;
 }
 
-static inline void set_rt_and_affinity_prio(int prio, int cpu){
+// static inline void set_rt_and_affinity_prio(int prio, int cpu){
+//     struct sched_param sp = { .sched_priority = prio };
+//     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+// #ifdef __linux__
+//     cpu_set_t set; CPU_ZERO(&set);
+//     CPU_SET(cpu >= 0 ? cpu : 0, &set);
+//     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+// #endif
+//     mlockall(MCL_CURRENT | MCL_FUTURE);
+// }
+
+static inline void set_rt_and_affinity_prio(int prio, int cpu_req)
+{
+    // try RT, but fall back silently
     struct sched_param sp = { .sched_priority = prio };
-    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        // Fallback to normal scheduling if we don't have CAP_SYS_NICE
+        sp.sched_priority = 0;
+        pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+    }
+
 #ifdef __linux__
+    // Clamp CPU id for small boards (Pi Zero has only CPU 0)
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    int cpu = (cpu_req >= 0) ? cpu_req : 0;
+    if (cpu >= ncpu) cpu = 0;               // clamp to CPU0 if out of range
+
     cpu_set_t set; CPU_ZERO(&set);
-    CPU_SET(cpu >= 0 ? cpu : 0, &set);
+    CPU_SET(cpu, &set);
+    // If this fails (EINVAL/EPERM), just proceed with default affinity
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #endif
+
+    // If mlockall fails on low-RAM systems, ignore and keep going
     mlockall(MCL_CURRENT | MCL_FUTURE);
 }
 
@@ -985,7 +1012,7 @@ static void* audio_writer_thread(void* arg){
     pthread_setname_np(pthread_self(),"audio_writer_thread");
     
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(36,2); 
+    set_rt_and_affinity_prio(36,-1); 
 
     // optional: make period/blocking behavior nicer
     while(a->active){
@@ -1329,7 +1356,7 @@ static void* dsp_producer_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(), "dsp_producer_thread");
     //set_rt_and_affinity();   // make sure this logs failures
-    set_rt_and_affinity_prio(45,2);
+    set_rt_and_affinity_prio(45,-1);
 
     dsp_producer_ctrl_t* ctrl = (dsp_producer_ctrl_t*)arg;
     if (!ctrl || !ctrl->tx || !ctrl->tx->fm || !ctrl->fifo ||
@@ -1439,7 +1466,7 @@ static void* rx_reader_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(),"rx_reader_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(38, 2); 
+    set_rt_and_affinity_prio(38, -1); 
 
     rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
     caribou_smi_st *smi = &ctrl->radio->sys->smi;
@@ -1761,15 +1788,15 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
         return -4;
 
     // Reader (4MS/s into 10ms frames)
-    p->rx_ctrl.active        = true;
-    p->rx_ctrl.radio         = radio;
-    p->rx_ctrl.rx_buffer     = malloc(sizeof(cariboulite_sample_complex_int16) * 40000);
-    p->rx_ctrl.rx_buffer_size= 40000;
-    p->rx_ctrl.rx_fifo       = &p->rxq;
-    if (!p->rx_ctrl.rx_buffer) return -5;
+    // p->rx_ctrl.active        = true;
+    // p->rx_ctrl.radio         = radio;
+    // p->rx_ctrl.rx_buffer     = malloc(sizeof(cariboulite_sample_complex_int16) * 40000);
+    // p->rx_ctrl.rx_buffer_size= 40000;
+    // p->rx_ctrl.rx_fifo       = &p->rxq;
+    // if (!p->rx_ctrl.rx_buffer) return -5;
 
-    if (pthread_create(&p->rx_thread, NULL, rx_reader_thread_func, &p->rx_ctrl) != 0)
-        return -6;
+    // if (pthread_create(&p->rx_thread, NULL, rx_reader_thread_func, &p->rx_ctrl) != 0)
+    //     return -6;
 
     // Set radio frequency
     HW_LOCK();
@@ -1802,6 +1829,16 @@ int rx_pipeline_start(rx_pipeline_t* p)
     caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)1); // RX on S1G
     HW_UNLOCK();
 
+    // start reader now (only when RX is active)
+    p->rx_ctrl.active        = true;
+    p->rx_ctrl.radio         = p->radio;
+    if (!p->rx_ctrl.rx_buffer) {
+        p->rx_ctrl.rx_buffer      = malloc(sizeof(cariboulite_sample_complex_int16) * 40000);
+        p->rx_ctrl.rx_buffer_size = 40000;
+        p->rx_ctrl.rx_fifo        = &p->rxq;
+    }
+    pthread_create(&p->rx_thread, NULL, rx_reader_thread_func, &p->rx_ctrl);
+
     __sync_synchronize();
     nbfm_rx_active = true;
 
@@ -1821,6 +1858,12 @@ void rx_pipeline_stop(rx_pipeline_t* p)
     caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)0);
     caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
     HW_UNLOCK();
+
+    // join reader here
+    p->rx_ctrl.active = false;
+    pthread_cancel(p->rx_thread);
+    pthread_join(p->rx_thread, NULL);
+
 
     p->running = false;
 }
@@ -1845,8 +1888,10 @@ void rx_pipeline_destroy(rx_pipeline_t* p)
     pthread_join(p->demod_thread, NULL);
     pthread_join(p->aw_thread, NULL);
 
-    if (p->rx_ctrl.rx_buffer) free(p->rx_ctrl.rx_buffer);
-    p->rx_ctrl.rx_buffer = NULL;
+    if (p->rx_ctrl.rx_buffer) {
+        free(p->rx_ctrl.rx_buffer);
+        p->rx_ctrl.rx_buffer = NULL;
+    }
 
     if (p->demod.pcm) snd_pcm_close(p->demod.pcm);
     aud10_fifo_destroy(&p->afifo);
@@ -1886,7 +1931,7 @@ static void* nbfm_demod_thread(void* arg)
 {
     pthread_setname_np(pthread_self(),"nbfm_demod_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(37,2);             
+    set_rt_and_affinity_prio(37,-1);             
     
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
     if (!c || !c->fifo_in || !c->pcm) return NULL;
@@ -2060,7 +2105,7 @@ static void* tx_writer_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(), "tx_writer_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(42,2);
+    set_rt_and_affinity_prio(42,-1);
 
 
     tx_writer_ctrl_st* ctrl = (tx_writer_ctrl_st*)arg;
