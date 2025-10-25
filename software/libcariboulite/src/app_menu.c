@@ -1012,7 +1012,7 @@ static void* audio_writer_thread(void* arg){
     pthread_setname_np(pthread_self(),"audio_writer_thread");
     
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(36,-1); 
+    set_rt_and_affinity_prio(42,-1); 
 
     // optional: make period/blocking behavior nicer
     while(a->active){
@@ -1466,7 +1466,7 @@ static void* rx_reader_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(),"rx_reader_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(38, -1); 
+    set_rt_and_affinity_prio(30, -1); 
 
     rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
     caribou_smi_st *smi = &ctrl->radio->sys->smi;
@@ -1493,7 +1493,7 @@ static void* rx_reader_thread_func(void* arg)
             };
 
             //rf10_fifo_put(ctrl->rx_fifo /*add to ctrl*/, &frm, -1);
-            if (!rf10_fifo_put(ctrl->rx_fifo, &frm, /*timeout_ms=*/0)) {
+            if (!rf10_fifo_put(ctrl->rx_fifo, &frm, /*timeout_ms=*/-1)) {
                 // FIFO full -> overwrite oldest already happened; just continue
                 // (you can keep a counter if you want to log drops)
             }
@@ -1572,7 +1572,7 @@ static int alsa_open_playback(snd_pcm_t **ppcm,
 
     // make buffer a bit deeper to avoid XRUN storms
     snd_pcm_uframes_t period = 480;    // 10 ms
-    snd_pcm_uframes_t buffer = 4800;   // 100 ms
+    snd_pcm_uframes_t buffer = 9600;   // 200 ms
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL);
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
 
@@ -1753,7 +1753,7 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
     p->radio = radio;
 
     // FIFOs
-    rf10_fifo_init(&p->rxq,  /*cap=*/64, /*drop_oldest_on_full=*/true);
+    rf10_fifo_init(&p->rxq,  /*cap=*/128, /*drop_oldest_on_full=*/true);
     aud10_fifo_init(&p->afifo, /*cap=*/64);
 
     // Open ALSA playback
@@ -1927,6 +1927,23 @@ static inline float deemph_48k(float x, float *z, float tau_s)
     return *z;
 }
 
+static inline float fast_atan2f(float y, float x) {
+    // 7th-order minimax (or a lighter 3rd-order) — plenty of references online
+    // placeholder: use your preferred fast atan2f implementation
+    const float ONEQTR_PI = (float)M_PI_4;        // π/4
+    const float THRQTR_PI = (float)(3.0f * M_PI_4); // 3π/4
+    float abs_y = fabsf(y) + 1e-10f;               // prevent 0/0
+    float angle;
+    if (x >= 0.0f) {
+        float r = (x - abs_y) / (x + abs_y);
+        angle = ONEQTR_PI - ONEQTR_PI * r;
+    } else {
+        float r = (x + abs_y) / (abs_y - x);
+        angle = THRQTR_PI - ONEQTR_PI * r;
+    }
+    return (y < 0.0f) ? -angle : angle;
+}
+
 
 // --- FM discriminator (atan2), 3/250 resample to 48k, deemphasis at 48k ---
 // --- Pre-demod CIC decimator (20 x 4) -> 50 kS/s, then limiter+atan2, 50k->48k, deemph @48k ---
@@ -1938,7 +1955,7 @@ static void* nbfm_demod_thread(void* arg)
 {
     pthread_setname_np(pthread_self(),"nbfm_demod_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(37,-1);             
+    set_rt_and_affinity_prio(41,-1);             
     
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
     if (!c || !c->fifo_in || !c->pcm) return NULL;
@@ -2027,7 +2044,8 @@ static void* nbfm_demod_thread(void* arg)
             if (have_prev50) {
                 const float re = i50 * pi50 + q50 * pq50;
                 const float im = q50 * pi50 - i50 * pq50;
-                const float dphi = atan2f(im, re);     // [-π, π]
+                //const float dphi = atan2f(im, re);     // [-π, π]
+                const float dphi = fast_atan2f(im, re);
                 y50 = dphi * K_norm;                   // normalize to ~±1 @ ±dev
             } else {
                 have_prev50 = 1;
@@ -2255,6 +2273,17 @@ static inline void tx_pipeline_get_stats(tx_pipeline_t* p, tx_pipeline_stats_t* 
 {
     if (!p || !out) return;
     rf10_fifo_get_stats(&p->txq, &out->txq);
+}
+
+// ---------- RX FIFO stats shim (useful for UI) ----------
+typedef struct {
+    rf10_stats_t rxq;
+} rx_pipeline_stats_t;
+
+static inline void rx_pipeline_get_stats(rx_pipeline_t* p, rx_pipeline_stats_t* out)
+{
+    if (!p || !out) return;
+    rf10_fifo_get_stats(&p->rxq, &out->rxq);
 }
 
 // static void nbfm_tx_tone(sys_st *sys)
@@ -2679,7 +2708,7 @@ static void nbfm_modem_selftest(sys_st *sys)
 
     // 1) Create RX FIFO and start the existing demod thread pointing to ALSA
     rf10_fifo_t rxq;
-    rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/true);
+    rf10_fifo_init(&rxq, /*cap=*/128, /*drop_oldest_on_full=*/false);
 
     nbfm_demod_ctrl_t dm = {
         .active      = true,
@@ -3202,7 +3231,7 @@ void monitor_modem_status(sys_st *sys)
 				// float fill_pct = (s.cap ? (100.0f * (float)s.count / (float)s.cap) : 0.f);
 				// long  lag      = (long)s.puts - (long)s.gets;  // frames queued since start
 
-				// // optional: rates since last sample
+				// optional: rates since last sample
 				// static struct timespec last_ts = {0};
 				// static rf10_stats_t    last_s  = {0};
 				// double rate_puts = 0.0, rate_gets = 0.0;
@@ -3210,11 +3239,11 @@ void monitor_modem_status(sys_st *sys)
 				// struct timespec now;
 				// clock_gettime(CLOCK_MONOTONIC, &now);
 				// if (last_ts.tv_sec != 0) {
-				// 	double dt = (now.tv_sec - last_ts.tv_sec) + (now.tv_nsec - last_ts.tv_nsec)/1e9;
-				// 	if (dt > 0.0) {
-				// 		rate_puts = (double)(s.puts - last_s.puts) / dt;
-				// 		rate_gets = (double)(s.gets - last_s.gets) / dt;
-				// 	}
+				// double dt = (now.tv_sec - last_ts.tv_sec) + (now.tv_nsec - last_ts.tv_nsec)/1e9;
+				//  	if (dt > 0.0) {
+				//  		rate_puts = (double)(s.puts - last_s.puts) / dt;
+				//  		rate_gets = (double)(s.gets - last_s.gets) / dt;
+				//  	}
 				// }
 				// last_ts = now; last_s = s;
 
@@ -3226,22 +3255,79 @@ void monitor_modem_status(sys_st *sys)
 				// printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
 				// 	rate_puts, rate_gets);
 
-                tx_pipeline_stats_t st;
-                tx_pipeline_get_stats(&txp, &st);
-                rf10_stats_t s = st.txq;
-                float fill_pct = (s.cap ? (100.0f * (float)s.count / (float)s.cap) : 0.f);
+                tx_pipeline_stats_t tst;
+                tx_pipeline_get_stats(&txp, &tst);
+                rf10_stats_t stx = tst.txq;
+                float tx_fill_pct = (stx.cap ? (100.0f * (float)stx.count / (float)stx.cap) : 0.f);
+                
+                // optional: rates since last sample
+				static struct timespec tx_last_ts = {0};
+				static rf10_stats_t    tx_last_s  = {0};
+				double tx_rate_puts = 0.0, tx_rate_gets = 0.0;
+
+				struct timespec now;
+				clock_gettime(CLOCK_MONOTONIC, &now);
+				if (tx_last_ts.tv_sec != 0) {
+				double dt = (now.tv_sec - tx_last_ts.tv_sec) + (now.tv_nsec - tx_last_ts.tv_nsec)/1e9;
+				 	if (dt > 0.0) {
+				 		tx_rate_puts = (double)(stx.puts - tx_last_s.puts) / dt;
+				 		tx_rate_gets = (double)(stx.gets - tx_last_s.gets) / dt;
+				 	}
+				}
+				tx_last_ts = now; tx_last_s = stx;
+                
                 printw("Linux TX FIFO:\n");
                 printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu\n",
-                    s.count, s.cap, fill_pct, s.min_depth, s.max_depth);
+                    stx.count, stx.cap, tx_fill_pct, stx.min_depth, stx.max_depth);
                 printw("    puts:%zu gets:%zu drops:%zu tO_put:%zu tO_get:%zu\n",
-                    s.puts, s.gets, s.drops, s.timeouts_put, s.timeouts_get);
+                    stx.puts, stx.gets, stx.drops, stx.timeouts_put, stx.timeouts_get);
+                printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
+				    tx_rate_puts, tx_rate_gets);
 
 				// If you want to highlight trouble:
-				if (s.min_depth == 0)          printw("    NOTE: Under-runs observed (producer late)\n");
-				if (s.drops > 0)               printw("    NOTE: Overwrites occurred (producer faster than writer)\n");
-				if (s.timeouts_put > 0)        printw("    NOTE: Producer timed out waiting to enqueue\n");
-				if (s.timeouts_get > 0)        printw("    NOTE: Writer timed out waiting for frames\n");
-			}
+				if (stx.min_depth == 0)          printw("    NOTE: Under-runs observed (producer late)\n");
+				if (stx.drops > 0)               printw("    NOTE: Overwrites occurred (producer faster than writer)\n");
+				if (stx.timeouts_put > 0)        printw("    NOTE: Producer timed out waiting to enqueue\n");
+				if (stx.timeouts_get > 0)        printw("    NOTE: Writer timed out waiting for frames\n");
+			
+                
+                
+                
+                rx_pipeline_stats_t rst;
+                rx_pipeline_get_stats(&rxp, &rst);
+                rf10_stats_t srx = rst.rxq;
+                float rx_fill_pct = (srx.cap ? (100.0f * (float)srx.count / (float)srx.cap) : 0.f);
+                
+                // optional: rates since last sample
+				static struct timespec rx_last_ts = {0};
+				static rf10_stats_t    rx_last_s  = {0};
+				double rx_rate_puts = 0.0, rx_rate_gets = 0.0;
+
+				if (rx_last_ts.tv_sec != 0) {
+				double dt = (now.tv_sec - rx_last_ts.tv_sec) + (now.tv_nsec - rx_last_ts.tv_nsec)/1e9;
+				 	if (dt > 0.0) {
+				 		rx_rate_puts = (double)(srx.puts - rx_last_s.puts) / dt;
+				 		rx_rate_gets = (double)(srx.gets - rx_last_s.gets) / dt;
+				 	}
+				}
+				rx_last_ts = now; rx_last_s = srx;
+                
+
+                printw("Linux RX FIFO:\n");
+                printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu\n",
+                    srx.count, srx.cap, rx_fill_pct, srx.min_depth, srx.max_depth);
+                printw("    puts:%zu gets:%zu drops:%zu tO_put:%zu tO_get:%zu\n",
+                    srx.puts, srx.gets, srx.drops, srx.timeouts_put, srx.timeouts_get);
+                printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
+				    rx_rate_puts, rx_rate_gets);
+                
+                // Same “trouble” hints, adapted to RX roles
+                if (srx.min_depth == 0)          printw("    NOTE: Under-runs observed (reader late)\n");
+                if (srx.drops > 0)               printw("    NOTE: Overwrites occurred (demod slower than reader)\n");
+                if (srx.timeouts_put > 0)        printw("    NOTE: Reader timed out waiting to enqueue\n");
+                if (srx.timeouts_get > 0)        printw("    NOTE: Demod timed out waiting for frames\n");
+
+            }
 		} 
 		
 		char key = 0;
@@ -3254,6 +3340,7 @@ void monitor_modem_status(sys_st *sys)
 
 		if (key == 'x' || key == 'X') {      // reset FIFO diagnostics
 			rf10_fifo_reset_stats(&txp.txq);
+            rf10_fifo_reset_stats(&rxp.rxq);
 		}
 		
 		// if(key == 't') // Press 't' to toggle TX state and RFFE
