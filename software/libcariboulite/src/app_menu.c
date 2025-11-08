@@ -998,6 +998,14 @@ static bool aud10_fifo_get(aud10_fifo_t* f, aud10_frame_t* out, int timeout_ms){
     return true;
 }
 
+// Peek audio FIFO depth without disturbing it
+static inline void aud10_fifo_peek_depth(aud10_fifo_t* f, size_t* count, size_t* cap){
+    pthread_mutex_lock(&f->m);
+    *count = f->count;
+    *cap   = f->cap;
+    pthread_mutex_unlock(&f->m);
+}
+
 typedef struct {
     bool active;
     snd_pcm_t* pcm;
@@ -1754,7 +1762,7 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
 
     // FIFOs
     rf10_fifo_init(&p->rxq,  /*cap=*/128, /*drop_oldest_on_full=*/true);
-    aud10_fifo_init(&p->afifo, /*cap=*/64);
+    aud10_fifo_init(&p->afifo, /*cap=*/256);
 
     // Open ALSA playback
     unsigned rate=0, channels=0;
@@ -1944,6 +1952,19 @@ static inline float fast_atan2f(float y, float x) {
     return (y < 0.0f) ? -angle : angle;
 }
 
+// Ultra-fast small-angle atan2f approximation
+// Error < 0.005 rad for |y/x| < 0.3 (typical in NBFM discriminator)
+static inline float fast_atan2f_small(float y, float x)
+{
+    // approximate atan(y/x) ≈ y / (|x| + 0.28f*|y|)
+    float abs_y = fabsf(y);
+    float abs_x = fabsf(x);
+    float angle = y / (abs_x + 0.28f * abs_y + 1e-10f);
+    if (x < 0.0f)
+        angle = (y >= 0.0f ? (float)M_PI + angle : -((float)M_PI - angle));
+    return angle;
+}
+
 
 // --- FM discriminator (atan2), 3/250 resample to 48k, deemphasis at 48k ---
 // --- Pre-demod CIC decimator (20 x 4) -> 50 kS/s, then limiter+atan2, 50k->48k, deemph @48k ---
@@ -2045,7 +2066,8 @@ static void* nbfm_demod_thread(void* arg)
                 const float re = i50 * pi50 + q50 * pq50;
                 const float im = q50 * pi50 - i50 * pq50;
                 //const float dphi = atan2f(im, re);     // [-π, π]
-                const float dphi = fast_atan2f(im, re);
+                //const float dphi = fast_atan2f(im, re);
+                const float dphi = fast_atan2f_small(im, re);
                 y50 = dphi * K_norm;                   // normalize to ~±1 @ ±dev
             } else {
                 have_prev50 = 1;
@@ -2053,58 +2075,218 @@ static void* nbfm_demod_thread(void* arg)
             pi50 = i50; pq50 = q50;
 
             // --- 50k -> 48k fixed 24/25 with linear interpolation ---
+            // y_prev_50k = y_curr_50k;
+            // y_curr_50k = y50;
+            // acc -= M;
+            // while (acc <= -M) acc += M;  // keep in [-M+1 .. 0]                                  // one 50k input arrived
+            // while (acc <= 0) {
+            //     // linear interp between last two 50k samples
+            //     float frac = (float)(acc + M) / (float)M;
+            //     if (frac < 0.f) frac = 0.f; else if (frac > 1.f) frac = 1.f;
+            //     float y_lin = y_prev_50k + frac * (y_curr_50k - y_prev_50k);
+
+            //     // DC block @ 48k
+            //     float x = y_lin;
+            //     float y = (x - x_prev_audio) + dc_a * dc_y;
+            //     x_prev_audio = x;
+            //     dc_y = y;
+            //     if (fabsf(dc_y) < 1e-20f) dc_y = 0.0f;
+
+            //     // de-emphasis @ 48k
+            //     float yd = deemph_48k(y, &deemph_state, c->deemph_tau);
+            //     if (fabsf(deemph_state) < 1e-20f) deemph_state= 0.0f;
+
+            //     // gentle audio LPF (~3.2 kHz) to tame residual hiss
+            //     lpf_y = lpf_a * lpf_y + lpf_b * yd;
+            //     float ya = lpf_y;
+            //     if (fabsf(lpf_y) < 1e-20f) lpf_y = 0.0f;
+
+            //     // to int16 with gain
+            //     float s = ya * c->pcm_gain;
+            //     if (s >  32767.f) s =  32767.f;
+            //     if (s < -32768.f) s = -32768.f;
+            //     audio_10ms[nout++] = (int16_t)lrintf(s);
+
+            //     acc += L;
+
+            //     if (nout == 480) {
+            //         //write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
+            //         aud10_frame_t frm;
+            //         memcpy(frm.pcm, audio_10ms, sizeof(audio_10ms));
+            //         aud10_fifo_put(c->afifo_out, &frm, /*timeout_ms=*/3);  // short wait; writer will smooth
+            //         // if timeout is a positive number, the fifo is not filling up...
+            //         // if timeout is a negative number, the fifo will fill up eventualy...
+            //         // either way after a few seconds the audio will have a periodic drop 
+            //         c->pcm_total_frames += 480;
+            //         nout = 0;
+
+            //         // heartbeat once per ~1 s
+            //         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            //         uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+            //         if (!last_log_ms) last_log_ms = ms;
+            //         if (ms - last_log_ms >= 1000) {
+            //             fprintf(stderr,
+            //                 "DEMOD: frames=%llu (%.1fs) ALSA=%s ch=%u  mid=50k  ratio=24/25\n",
+            //                 (unsigned long long)c->pcm_total_frames,
+            //                 (double)c->pcm_total_frames / (double)c->pcm_rate,
+            //                 pcm_state_name(snd_pcm_state(c->pcm)),
+            //                 c->pcm_channels);
+            //             last_log_ms = ms;
+            //         }
+            //     }
+            // }
+            // if (acc > L) acc %= L;  // prevent overflow
+            
+            // --- 50k → 48k adaptive resampler (fractional-step with tiny PLL/servo) ---
+            // --- 50k → 48k adaptive resampler (correct: ≤1 output per 50k input) ---
+            // Persistent state
+            static double phase48 = 0.0;                 // in [0..1)
+            static double corr48  = 0.0;                 // small fractional correction (unitless)
+            static double depth_ema = 0.0;        // smoothed FIFO depth
+            static int    servo_tick = 0;
+            
+            // Nominal outputs per 50k input (r < 1 for downsampling)
+            const double r_nom = 48000.0 / 50000.0;      // 0.96
+            const int    upd_every_inputs = 500;      // ≈10 ms @ 50 kS/s
+            const double alpha = 0.05;                // EMA smoothing on depth (0.02..0.1)
+            const double ki    = 2.0e-4;              // integral gain per update (start small)
+            const double corr_ppm_cap = 1.0e-3;       // ±1000 ppm hard clamp
+            const double corr_ppm_slew = 2.0e-5;      // ±20 ppm per update slew limit
+            const double target_fill = 0.50;          // 50% of capacity
+            const double deadband = 0.02;             // ±2% fill deadband to avoid hunting
+
+            // Servo tuning
+            //const double kp = 1.0e-3;                    // 8e-4..1.5e-3
+            
+            // Prime: let FIFO rise near target before engaging strongly
+            static int primed = 0;
+
+            // Update correction ~every 10 ms of 50k inputs (here each RF frame start or use a small counter)
+            // if (++servo_tick >= 500) {                   // 500 inputs @50k ≈ 10 ms
+            //     servo_tick = 0;
+            //     size_t acnt=0, acap=0;
+            //     aud10_fifo_peek_depth(c->afifo_out, &acnt, &acap);
+            //     const double target = 0.50 * (double)acap;   // aim ~50% fill
+            //     const double err    = (double)acnt - target; // +err => slow down production
+
+            //     // integrator with tiny leak for damping
+            //     corr48 = 0.9999 * corr48 - kp * err;
+
+            //     // clamp correction to ±5% (temporarily wide to find true steady-state)
+            //     if (corr48 >  5.0e-2) corr48 =  5.0e-2;
+            //     if (corr48 < -5.0e-2) corr48 = -5.0e-2;
+
+            //     // emergency brake if very full
+            //     const double fill = (double)acnt / (double)acap;
+            //     if (fill > 0.90) corr48 = -5.0e-2;          // slow production
+            // }
+
+            // Update every ~10 ms worth of 50k inputs
+            if (++servo_tick >= upd_every_inputs) {
+                servo_tick = 0;
+
+                size_t acnt = 0, acap = 0;
+                aud10_fifo_peek_depth(c->afifo_out, &acnt, &acap);
+                const double fill = (acap ? (double)acnt / (double)acap : 0.0);
+
+                // smooth depth
+                if (depth_ema == 0.0) depth_ema = (double)acnt;  // init on first call
+                depth_ema = (1.0 - alpha) * depth_ema + alpha * (double)acnt;
+
+                // engage after we’re in the neighborhood (prevents big initial pulls)
+                if (!primed) {
+                    if (fill >= 0.35) primed = 1;   // start controlling once buffer >35%
+                }
+
+                double err = 0.0;
+                if (primed) {
+                    const double target = target_fill * (double)acap;
+                    const double err_raw = (double)depth_ema - target; // +err => we’re overfilling
+                    // deadband -> zero out small errors to avoid audible dither
+                    if (fabs(err_raw) > deadband * (double)acap)
+                        err = err_raw;
+                }
+
+                // integral update with slew limit
+                double corr_prev = corr48;
+                corr48 += -ki * (err / (double)acap);  // unitless; negative feedback
+
+                // slew limit (per update) to avoid pitch steps
+                double dc = corr48 - corr_prev;
+                if (dc >  corr_ppm_slew) corr48 = corr_prev + corr_ppm_slew;
+                if (dc < -corr_ppm_slew) corr48 = corr_prev - corr_ppm_slew;
+
+                // hard clamp
+                if (corr48 >  corr_ppm_cap) corr48 =  corr_ppm_cap;
+                if (corr48 < -corr_ppm_cap) corr48 = -corr_ppm_cap;
+
+                // optional: emergency brake if nearly full/empty (still gentle)
+                if (fill > 0.95) corr48 = fmin(corr48, -5e-4);  // nudge downrate by 500 ppm
+                if (fill < 0.05) corr48 = fmax(corr48,  5e-4);  // nudge uprate by 500 ppm
+
+                // (for your log) print ppm not fraction
+                fprintf(stderr, "corr=%.1f ppm  fill=%.0f%%\n", corr48*1e6, 100.0*fill);
+            }
+
+            // Interpolation endpoints for this 50k interval
             y_prev_50k = y_curr_50k;
             y_curr_50k = y50;
-            acc -= M;                                  // one 50k input arrived
-            while (acc <= 0) {
-                // linear interp between last two 50k samples
-                float frac = (float)(acc + M) / (float)M;
-                if (frac < 0.f) frac = 0.f; else if (frac > 1.f) frac = 1.f;
-                float y_lin = y_prev_50k + frac * (y_curr_50k - y_prev_50k);
 
-                // DC block @ 48k
+            // Advance phase by "outputs per input" this step (r < 1)
+            const double r = r_nom * (1.0 + corr48);
+            phase48 += r;
+
+            // If we crossed 1.0, emit exactly one 48k sample at that crossing
+            if (phase48 >= 1.0) {
+                // crossing fractional position within current 50k interval
+                const double frac = (phase48 - 1.0) / r;    // ∈ [0..1)
+                float y_lin = y_prev_50k + (float)frac * (y_curr_50k - y_prev_50k);
+
+                // === 48k audio chain (unchanged) ===
                 float x = y_lin;
                 float y = (x - x_prev_audio) + dc_a * dc_y;
                 x_prev_audio = x;
-                dc_y = y;
+                dc_y = y; if (fabsf(dc_y) < 1e-20f) dc_y = 0.0f;
 
-                // de-emphasis @ 48k
                 float yd = deemph_48k(y, &deemph_state, c->deemph_tau);
+                if (fabsf(deemph_state) < 1e-20f) deemph_state = 0.0f;
 
-                // gentle audio LPF (~3.2 kHz) to tame residual hiss
                 lpf_y = lpf_a * lpf_y + lpf_b * yd;
                 float ya = lpf_y;
+                if (fabsf(lpf_y) < 1e-20f) lpf_y = 0.0f;
 
-                // to int16 with gain
                 float s = ya * c->pcm_gain;
                 if (s >  32767.f) s =  32767.f;
                 if (s < -32768.f) s = -32768.f;
                 audio_10ms[nout++] = (int16_t)lrintf(s);
 
-                acc += L;
-
+                // hand off in 10 ms chunks
                 if (nout == 480) {
-                    //write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
-                    aud10_frame_t frm;
-                    memcpy(frm.pcm, audio_10ms, sizeof(audio_10ms));
-                    aud10_fifo_put(c->afifo_out, &frm, /*timeout_ms=*/-1);  // short wait; writer will smooth
+                    aud10_frame_t af; memcpy(af.pcm, audio_10ms, sizeof(audio_10ms));
+                    aud10_fifo_put(c->afifo_out, &af, /*timeout_ms=*/10);
                     c->pcm_total_frames += 480;
                     nout = 0;
 
-                    // heartbeat once per ~1 s
+                    // heartbeat (optional)
                     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                    uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+                    uint64_t ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
                     if (!last_log_ms) last_log_ms = ms;
                     if (ms - last_log_ms >= 1000) {
+                        size_t acnt=0, acap=0;
+                        aud10_fifo_peek_depth(c->afifo_out, &acnt, &acap);
                         fprintf(stderr,
-                            "DEMOD: frames=%llu (%.1fs) ALSA=%s ch=%u  mid=50k  ratio=24/25\n",
+                            "DEMOD: frames=%llu (%.1fs) ALSA=%s  aud_fifo=%zu/%zu (%.0f%%)  corr=%.5f\n",
                             (unsigned long long)c->pcm_total_frames,
                             (double)c->pcm_total_frames / (double)c->pcm_rate,
                             pcm_state_name(snd_pcm_state(c->pcm)),
-                            c->pcm_channels);
+                            acnt, acap, 100.0 * (double)acnt / (double)acap,
+                            corr48);
                         last_log_ms = ms;
                     }
                 }
+
+                // keep fractional remainder
+                phase48 -= 1.0;
             }
         }
     }
@@ -2285,161 +2467,6 @@ static inline void rx_pipeline_get_stats(rx_pipeline_t* p, rx_pipeline_stats_t* 
     if (!p || !out) return;
     rf10_fifo_get_stats(&p->rxq, &out->rxq);
 }
-
-// static void nbfm_tx_tone(sys_st *sys)
-// {
-//     // mirror monitor_modem_status() semantics, but without ncurses/instrumentation
-//     nbfm_tx_active = false;
-//     nbfm_rx_active = false;
-
-//     double frequency = 430100000;   // Hz
-//     int    tx_power  = -3;          // dBm
-
-//     // --- TX buffers & control blocks (TX only; no RX thread here) ---
-//     const int iq_tx_buffer_size = (1u << 18);
-//     cariboulite_sample_complex_int16 iq_tx_buffer[iq_tx_buffer_size];
-
-//     cariboulite_radio_state_st *radio = &sys->radio_low;
-
-//     // FIFO for 10ms frames
-//     rf10_fifo_t txq;
-//     rf10_fifo_init(&txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
-
-//     tx_writer_ctrl_st tx_ctrl = {
-//         .active        = true,
-//         .radio         = radio,
-//         .tx_buffer     = iq_tx_buffer,
-//         .tx_buffer_size= iq_tx_buffer_size,
-//         .live_from_mic = false,
-//         .mic           = NULL,
-//         .tone_mode     = true,
-//         .tone_hz       = 600.0f,
-//         .tone_amp      = 0.4f,
-//         .tone_phase    = 0.0f,
-//         .fifo          = &txq,
-//         .fm            = NULL,
-//         .a48k          = NULL,
-//         .iq4m          = NULL,
-//     };
-
-//     // Modulator & scratch (same config as monitor_modem_status)
-//     nbfm4m_cfg_t cfg = {
-//         .audio_fs      = 48000.0,
-//         .rf_fs         = 4000000.0,
-//         .f_dev_hz      = 2500.0,
-//         .preemph_tau_s = 0.0,
-//         .out_scale     = 4000.0f,
-//         .linear_interp = 1,
-//     };
-//     tx_ctrl.fm   = nbfm4m_create(&cfg);
-//     tx_ctrl.a48k = (float*)calloc(480,    sizeof(float));
-//     tx_ctrl.iq4m = (iq16_t*)calloc(40000, sizeof(iq16_t));
-
-//     if (!tx_ctrl.fm || !tx_ctrl.a48k || !tx_ctrl.iq4m) {
-//         fprintf(stderr, "[nbfm_tx_tone] init failed (fm=%p a48k=%p iq4m=%p)\n",
-//                 (void*)tx_ctrl.fm, (void*)tx_ctrl.a48k, (void*)tx_ctrl.iq4m);
-//         if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
-//         if (tx_ctrl.a48k) free(tx_ctrl.a48k);
-//         if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
-//         rf10_fifo_destroy(&txq);
-//         return;
-//     }
-
-//     // Start DSP producer + TX writer threads (same as monitor_)
-//     pthread_t dsp_thread, tx_thread;
-
-//     dsp_producer_ctrl_t dsp_ctrl = {
-//         .active = true,
-//         .tx     = &tx_ctrl,
-//         .fifo   = &txq,
-//     };
-//     pthread_create(&dsp_thread, NULL, dsp_producer_thread_func, &dsp_ctrl);
-//     pthread_create(&tx_thread,  NULL, tx_writer_thread_func,    &tx_ctrl);
-
-//     // Radio base config
-//     HW_LOCK();
-//     cariboulite_radio_set_frequency(radio, true, &frequency);
-//     cariboulite_radio_set_tx_power(radio, tx_power);
-//     HW_UNLOCK();
-//     radio->tx_loopback_anabled   = false;
-//     radio->tx_control_with_iq_if = true;
-
-//     // --- Minimal CLI: 1 = toggle TX, 99 = exit ---
-//     for (;;) {
-//         int choice = -1;
-// 		printf("TX frequency: %.0f Hz\n",round(frequency/1000)*1000);
-// 		printf("TX power: %d dBm\n",tx_power);
-//         printf(" [ 1] Toggle NBFM TX\n"); 
-// 		printf(" [99] Return to main menu\n");
-//         printf(" Choice: ");
-//         if (scanf("%d", &choice) != 1) {
-//             // flush junk on input error
-//             int c; while ((c = getchar()) != '\n' && c != EOF) {}
-//             continue;
-//         }
-
-//         if (choice == 1) {
-//             // exactly like 't' path in monitor_modem_status()
-//             if (!nbfm_tx_active) {
-//                 if (nbfm_rx_active) {
-//                     nbfm_rx_active = false;
-//                     HW_LOCK();
-//                     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-//                     HW_UNLOCK();
-//                 }
-//                 HW_LOCK();
-//                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_tx_lowpass);
-//                 cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
-//                 caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)3); // TX
-//                 HW_UNLOCK();
-
-//                 __sync_synchronize();   // memory barrier
-//                 nbfm_tx_active = true;  // tell writer LAST
-//                 printf("TX: ON\n");
-//             } else {
-//                 nbfm_tx_active = false;
-//                 __sync_synchronize();
-
-//                 HW_LOCK();
-//                 caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
-//                 cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-//                 caribou_fpga_set_io_ctrl_mode(&sys->fpga, 0, caribou_fpga_io_ctrl_rfm_low_power);
-//                 HW_UNLOCK();
-//                 printf("TX: OFF\n");
-//             }
-//         } else if (choice == 99) {
-//             break;
-//         }
-//     }
-
-//     // --- Teardown (same order/pattern as monitor_modem_status) ---
-//     nbfm_tx_active = false;
-//     nbfm_rx_active = false;
-//     smi_idle(sys);
-
-//     HW_LOCK();
-//     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-//     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-//     HW_UNLOCK();
-//     usleep(30 * 1000);
-
-//     tx_ctrl.active  = false;
-//     dsp_ctrl.active = false;
-//     rf10_fifo_stop(&txq);
-
-//     pthread_cancel(tx_thread);
-//     pthread_cancel(dsp_thread);
-//     pthread_join(tx_thread, NULL);
-//     pthread_join(dsp_thread, NULL);
-
-//     rf10_fifo_destroy(&txq);
-
-//     if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
-//     if (tx_ctrl.a48k) free(tx_ctrl.a48k);
-//     if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
-
-//     printf("NBFM TX tone stopped.\n");
-// }
 
 static void nbfm_tx_tone(sys_st *sys)
 {
@@ -2857,10 +2884,6 @@ static void nbfm_modem_selftest(sys_st *sys)
     free(a48k);
     free(iq4m);
     
-    
-    
-    
-
     fprintf(stderr, "[selftest] done — you should have heard a 600 Hz tone.\n");
 }
 
@@ -2868,7 +2891,7 @@ void monitor_modem_status(sys_st *sys)
 {
 	//mlockall(MCL_CURRENT | MCL_FUTURE);
     
-        // --- NEW: pipelines ---
+    // --- NEW: pipelines ---
     tx_pipeline_t txp = {0};
     rx_pipeline_t rxp = {0};
 
@@ -2939,120 +2962,7 @@ void monitor_modem_status(sys_st *sys)
     .tx_buffer_size = iq_tx_buffer_size,
     };
     
-    // // --- NBFM RX audio path (demod → ALSA) ---
-    // rf10_fifo_t      rxq;            // IQ 10 ms frames from rx_reader → demod
-    // aud10_fifo_t     afifo;          // 10 ms PCM frames demod → ALSA writer
-    // nbfm_demod_ctrl_t dm = {0};
-    // audio_writer_ctrl_t aw = {0};
-    // pthread_t        demod_th, aw_th;
 
-	// // ---- create FIFO with a few frames of cushion (e.g., 8–12) ----
-	// rf10_fifo_t txq;
-	// //rf10_fifo_init(&txq, /*cap=*/32, /*drop_oldest_on_full=*/true);
-	// rf10_fifo_init(&txq, /*cap=*/64, /*drop_oldest_on_full=*/false);
-    
-    // // ---- fill tx_ctrl, once ----
-	// tx_ctrl.active        = true;
-	// tx_ctrl.radio         = radio;
-	// tx_ctrl.fifo          = &txq;          // give writer the FIFO
-	// tx_ctrl.live_from_mic = false;	       // set true to enable audio input
-
-	// tx_ctrl.tone_mode     = true;         // true => synthesize a audio tone
-	// tx_ctrl.tone_hz       = 600.0f;
-	// tx_ctrl.tone_amp      = 0.4f;
-	// tx_ctrl.tone_phase    = 0.0f;
-    
-    // // FIFO for RX (IQ@4M → 10ms)
-    // rf10_fifo_init(&rxq, /*cap=*/64, /*drop_oldest_on_full=*/false);
-    // rx_ctrl.rx_fifo = &rxq;   // <-- give reader a place to push frames
-
-    // // Audio FIFO and ALSA playback
-    // aud10_fifo_init(&afifo, /*cap=*/64);
-    // if (alsa_open_playback(&dm.pcm, "plughw:3,0", &dm.pcm_rate, &dm.pcm_channels) != 0) {
-    //     endwin();
-    //     fprintf(stderr, "[monitor] ALSA open failed\n");
-    //     rf10_fifo_destroy(&rxq);
-    //     return;
-    // }
-    // alsa_tune_sw(dm.pcm);
-
-    // // ping: quick ping of 2.525 kHz tone to signal audio path is closing
-    // int16_t ping[12000]; // 0.25s @ 48k
-    // for (int i = 0; i < 12000; i++) {
-    //     float x = sinf(2.f * M_PI * 2525.f * (float)i / 48000.f);
-    //     ping[i] = (int16_t)lrintf(0.6f * 32767.f * x);
-    // }
-    // write_exact_alsa_16(dm.pcm, ping, 12000, /*channels*/dm.pcm_channels);  // same as speaker-test
-
-    // // Audio writer thread (pulls 10 ms blocks from afifo → ALSA)
-    // aw.active   = true;
-    // aw.pcm      = dm.pcm;
-    // aw.channels = dm.pcm_channels;
-    // aw.fifo     = &afifo;
-    // pthread_create(&aw_th, NULL, audio_writer_thread, &aw);
-
-    // // Demod thread (pulls 10 ms IQ from rxq → 10 ms audio → afifo)
-    // dm.active          = true;
-    // dm.fifo_in         = &rxq;
-    // dm.afifo_out       = &afifo;
-    // dm.fs_rf           = 4000000.0f;
-    // dm.fs_audio        = 48000.0f;
-    // dm.deemph_tau      = 50e-6f;          // 50 µs EU (or 75e-6f for NA)
-    // dm.pcm_gain        = 8000.0f;         // tweak to taste
-    // dm.pcm_total_frames= 0;
-
-    // pthread_create(&demod_th, NULL, nbfm_demod_thread, &dm);
-
-    // // Start RX reader thread
-    // pthread_create(&rx_thread, NULL, rx_reader_thread_func, &rx_ctrl);
-    
-
-	// // ALSA before threads
-	// //tx_ctrl.mic = alsa48k_create("plughw:10,1", 1.0f);  // input side of loopback device
-	// //tx_ctrl.mic = alsa48k_create("plughw:3,0", 1.0f); // input side of usb audio device
-	// tx_ctrl.mic = NULL; // uncommnent if you want the use the inbuild tone generator
-
-	// // Modulator & scratch before threads
-	// nbfm4m_cfg_t cfg = {
-	// 	.audio_fs      = 48000.0,
-	// 	.rf_fs         = 4000000.0,
-	// 	.f_dev_hz      = 2500.0,
-	// 	.preemph_tau_s = 0.0,
-	// 	.out_scale     = 4000.0f,
-	// 	.linear_interp = 1,
-	// };
-	// tx_ctrl.fm   = nbfm4m_create(&cfg);
-	// tx_ctrl.a48k = (float*)calloc(480,    sizeof(float));
-	// tx_ctrl.iq4m = (iq16_t*)calloc(40000, sizeof(iq16_t));
-
-	// // HARD FAIL if any is NULL — do NOT start threads
-    // if (!tx_ctrl.fm || !tx_ctrl.a48k || !tx_ctrl.iq4m) {
-	// 	endwin();
-	// 	fprintf(stderr, "[monitor] init failed (fm=%p a48k=%p iq4m=%p)\n",
-	// 			(void*)tx_ctrl.fm, (void*)tx_ctrl.a48k, (void*)tx_ctrl.iq4m);
-
-	// 	if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
-	// 	if (tx_ctrl.a48k) free(tx_ctrl.a48k);
-	// 	if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
-
-	// 	// If you created the FIFO already, destroy it:
-	// 	rf10_fifo_destroy(&txq);
-	// 	return;
-    // }
-	
-
-	// // Start the DSP producer thread
-	// pthread_t dsp_thread;
-	// dsp_producer_ctrl_t dsp_ctrl = {
-	// 	.active = true,
-	// 	.tx     = &tx_ctrl,
-	// 	.fifo   = &txq,
-	// };
-	// pthread_create(&dsp_thread, NULL, dsp_producer_thread_func, &dsp_ctrl);
-
-	// // now start the thread
-	// pthread_t tx_thread;
-	// pthread_create(&tx_thread, NULL, tx_writer_thread_func, &tx_ctrl);
 
 	//int screen_max_y; 
 	int screen_max_x;
@@ -3099,237 +3009,198 @@ void monitor_modem_status(sys_st *sys)
 		move(3,0);
 		//refresh();
 
-		{
-			uint8_t data[3] = {0};
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF_IQIFC0, data, 3);
-			HW_UNLOCK();
-			uint8_t iqifc0 = data[0];
-			uint8_t iqifc1 = data[1];
-			uint8_t iqifc2 = data[2];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF_CFG, data, 1);
-			HW_UNLOCK();
-			uint8_t rf_cfg = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF_CLKO, data, 1);
-			HW_UNLOCK();
-			uint8_t rf_clko = data[0];
-			printw("    RF_CFG:0x%02X  RF_CLKO:0x%02X\n", rf_cfg, rf_clko);
-			printw("    IQIFC0:0x%02X  IQIFC1:0x%02X  IQIFC2:0x%02X\n", iqifc0, iqifc1, iqifc2);
-			//refresh();
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_TXDFE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_txdfe = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_TXDFE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_txdfe = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_RXDFE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_rxdfe = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_RXDFE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_rxdfe = data[0];
-			printw("    RF09-RXFDE :0x%02X  RF24-RXDFE :0x%02X\n", rf09_rxdfe, rf24_rxdfe);
-			printw("    RF09-TXFDE :0x%02X  RF24-TXDFE :0x%02X\n", rf09_txdfe, rf24_txdfe);
-			//refresh();
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_STATE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_state = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_STATE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_state = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_IRQS, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_irqs = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_IRQS, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_irqs = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_IRQM, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_irqm = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_IRQM, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_irqm = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_PAC, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_pac = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_PAC, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_pac = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF09_PADFE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf09_padfe = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, REG_RF24_PADFE, data, 1);
-			HW_UNLOCK();
-			uint8_t rf24_padfe = data[0];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, 0x0127, data, 2); //REG_RF09_TXDACI, REG_RF09_TXDACQ
-			HW_UNLOCK();
-			uint8_t rf09_txdaci = data[0];
-			uint8_t rf09_txdacq = data[1];
-			HW_LOCK();
-			at86rf215_read_buffer(modem, 0x0227, data, 2); //REG_RF24_TXDACI, REG_RF24_TXDACQ
-			HW_UNLOCK();
-			uint8_t rf24_txdaci = data[0];
-			uint8_t rf24_txdacq = data[1];
-			printw("    RF09-PADFE :0x%02X  RF24-PADFE :0x%02X\n", rf09_padfe, rf24_padfe);
-			printw("    RF09-PAC   :0x%02X  RF24-PAC   :0x%02X\n", rf09_pac,   rf24_pac);
-			printw("    RF09-IRQM  :0x%02X  RF24-IRQM  :0x%02X\n", rf09_irqm,  rf24_irqm);
-			printw("    RF09-IQRS  :0x%02X  RF24-IRQS  :0x%02X\n", rf09_irqs,  rf24_irqs);	
-			printw("    RF09-STATE :0x%02X  RF24-STATE :0x%02X\n", rf09_state, rf24_state);
-			printw("    RF09-TXDACI:0x%02X  RF24-TXDACI:0x%02X\n", rf09_txdaci, rf24_txdaci);
-			printw("    RF09-TXDACQ:0x%02X  RF24-TXDACQ:0x%02X\n", rf09_txdacq, rf24_txdacq);
-			//refresh();
-			HW_LOCK();
-			caribou_fpga_get_smi_ctrl_fifo_status(&sys->fpga, &status);
-			HW_UNLOCK();
-			printw("FPGA SMI info (0x%02X):\n", *val);
-			printw("    RX FIFO EMPTY: %d\n", status.rx_fifo_empty);
-			printw("    TX FIFO FULL : %d\n", status.tx_fifo_full);
-			printw("    SMI CHANNEL  : %d    // 0=RX09 1=RX24\n", status.smi_channel);
-			printw("    SMI DIRECTION: %d    // 0=TX   1=RX\n", status.smi_direction);
-			//refresh();
-			HW_LOCK();
-			caribou_fpga_get_io_ctrl_mode(&sys->fpga, &debug, &mode);
-			HW_UNLOCK();
-			printw("    DEBUG = %d, MODE: '%s'\n", debug, caribou_fpga_get_mode_name(mode));
-			//refresh();
-			printw("IQ Data Stream:\n");
-			printw("    TX_I:0x%08X  TX_Q:0x%08X\n", latest_tx_sample.i, latest_tx_sample.q);
-			printw("    RX_I:0x%08X  RX_Q:0x%08X\n", latest_rx_sample.i, latest_rx_sample.q);
-			//refresh();
-			//smi_state = caribou_smi_get_driver_streaming_state(smi);
-			//printw("SMI driver state: 0x%02X    // 0=idle 1=RX09 2=RX24 3=TX\n",(uint8_t) smi->state);
-			uint8_t tx_sample_gap = 1;
-			HW_LOCK();
-			caribou_fpga_get_sys_ctrl_tx_sample_gap(fpga, &tx_sample_gap);
-			HW_UNLOCK();
-			//printw("TX sample gap: %d\n", tx_sample_gap);
-			//refresh();
+        uint8_t data[3] = {0};
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF_IQIFC0, data, 3);
+        HW_UNLOCK();
+        uint8_t iqifc0 = data[0];
+        uint8_t iqifc1 = data[1];
+        uint8_t iqifc2 = data[2];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF_CFG, data, 1);
+        HW_UNLOCK();
+        uint8_t rf_cfg = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF_CLKO, data, 1);
+        HW_UNLOCK();
+        uint8_t rf_clko = data[0];
+        printw("    RF_CFG:0x%02X  RF_CLKO:0x%02X\n", rf_cfg, rf_clko);
+        printw("    IQIFC0:0x%02X  IQIFC1:0x%02X  IQIFC2:0x%02X\n", iqifc0, iqifc1, iqifc2);
+        //refresh();
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_TXDFE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_txdfe = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_TXDFE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_txdfe = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_RXDFE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_rxdfe = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_RXDFE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_rxdfe = data[0];
+        printw("    RF09-RXFDE :0x%02X  RF24-RXDFE :0x%02X\n", rf09_rxdfe, rf24_rxdfe);
+        printw("    RF09-TXFDE :0x%02X  RF24-TXDFE :0x%02X\n", rf09_txdfe, rf24_txdfe);
+        //refresh();
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_STATE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_state = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_STATE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_state = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_IRQS, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_irqs = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_IRQS, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_irqs = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_IRQM, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_irqm = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_IRQM, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_irqm = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_PAC, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_pac = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_PAC, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_pac = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_PADFE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_padfe = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_PADFE, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_padfe = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, 0x0127, data, 2); //REG_RF09_TXDACI, REG_RF09_TXDACQ
+        HW_UNLOCK();
+        uint8_t rf09_txdaci = data[0];
+        uint8_t rf09_txdacq = data[1];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, 0x0227, data, 2); //REG_RF24_TXDACI, REG_RF24_TXDACQ
+        HW_UNLOCK();
+        uint8_t rf24_txdaci = data[0];
+        uint8_t rf24_txdacq = data[1];
+        printw("    RF09-PADFE :0x%02X  RF24-PADFE :0x%02X\n", rf09_padfe, rf24_padfe);
+        printw("    RF09-PAC   :0x%02X  RF24-PAC   :0x%02X\n", rf09_pac,   rf24_pac);
+        printw("    RF09-IRQM  :0x%02X  RF24-IRQM  :0x%02X\n", rf09_irqm,  rf24_irqm);
+        printw("    RF09-IQRS  :0x%02X  RF24-IRQS  :0x%02X\n", rf09_irqs,  rf24_irqs);	
+        printw("    RF09-STATE :0x%02X  RF24-STATE :0x%02X\n", rf09_state, rf24_state);
+        printw("    RF09-TXDACI:0x%02X  RF24-TXDACI:0x%02X\n", rf09_txdaci, rf24_txdaci);
+        printw("    RF09-TXDACQ:0x%02X  RF24-TXDACQ:0x%02X\n", rf09_txdacq, rf24_txdacq);
+        //refresh();
+        HW_LOCK();
+        caribou_fpga_get_smi_ctrl_fifo_status(&sys->fpga, &status);
+        HW_UNLOCK();
+        printw("FPGA SMI info (0x%02X):\n", *val);
+        printw("    RX FIFO EMPTY: %d\n", status.rx_fifo_empty);
+        printw("    TX FIFO FULL : %d\n", status.tx_fifo_full);
+        printw("    SMI CHANNEL  : %d    // 0=RX09 1=RX24\n", status.smi_channel);
+        printw("    SMI DIRECTION: %d    // 0=TX   1=RX\n", status.smi_direction);
+        //refresh();
+        HW_LOCK();
+        caribou_fpga_get_io_ctrl_mode(&sys->fpga, &debug, &mode);
+        HW_UNLOCK();
+        printw("    DEBUG = %d, MODE: '%s'\n", debug, caribou_fpga_get_mode_name(mode));
+        //refresh();
+        printw("IQ Data Stream:\n");
+        printw("    TX_I:0x%08X  TX_Q:0x%08X\n", latest_tx_sample.i, latest_tx_sample.q);
+        printw("    RX_I:0x%08X  RX_Q:0x%08X\n", latest_rx_sample.i, latest_rx_sample.q);
+        //refresh();
+        //smi_state = caribou_smi_get_driver_streaming_state(smi);
+        //printw("SMI driver state: 0x%02X    // 0=idle 1=RX09 2=RX24 3=TX\n",(uint8_t) smi->state);
+        uint8_t tx_sample_gap = 1;
+        HW_LOCK();
+        caribou_fpga_get_sys_ctrl_tx_sample_gap(fpga, &tx_sample_gap);
+        HW_UNLOCK();
+        //printw("TX sample gap: %d\n", tx_sample_gap);
+        //refresh();
 
-			// --- TX FIFO stats panel ---
-			{
-				// rf10_stats_t s; 
-				// rf10_fifo_get_stats(&txq, &s);
+        // --- TX FIFO stats panel ---
+        
+        tx_pipeline_stats_t tst;
+        tx_pipeline_get_stats(&txp, &tst);
+        rf10_stats_t stx = tst.txq;
+        float tx_fill_pct = (stx.cap ? (100.0f * (float)stx.count / (float)stx.cap) : 0.f);
+        
+        // optional: rates since last sample
+        static struct timespec tx_last_ts = {0};
+        static rf10_stats_t    tx_last_s  = {0};
+        double tx_rate_puts = 0.0, tx_rate_gets = 0.0;
 
-				// // simple fill % and lag (producer - consumer)
-				// float fill_pct = (s.cap ? (100.0f * (float)s.count / (float)s.cap) : 0.f);
-				// long  lag      = (long)s.puts - (long)s.gets;  // frames queued since start
-
-				// optional: rates since last sample
-				// static struct timespec last_ts = {0};
-				// static rf10_stats_t    last_s  = {0};
-				// double rate_puts = 0.0, rate_gets = 0.0;
-
-				// struct timespec now;
-				// clock_gettime(CLOCK_MONOTONIC, &now);
-				// if (last_ts.tv_sec != 0) {
-				// double dt = (now.tv_sec - last_ts.tv_sec) + (now.tv_nsec - last_ts.tv_nsec)/1e9;
-				//  	if (dt > 0.0) {
-				//  		rate_puts = (double)(s.puts - last_s.puts) / dt;
-				//  		rate_gets = (double)(s.gets - last_s.gets) / dt;
-				//  	}
-				// }
-				// last_ts = now; last_s = s;
-
-				// printw("Linux TX FIFO:\n");
-				// printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu, lag:%ld\n",
-				// 	s.count, s.cap, fill_pct, s.min_depth, s.max_depth, lag);
-				// printw("    puts:%zu  gets:%zu  drops:%zu  tO_put:%zu  tO_get:%zu\n",
-				// 	s.puts, s.gets, s.drops, s.timeouts_put, s.timeouts_get);
-				// printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
-				// 	rate_puts, rate_gets);
-
-                tx_pipeline_stats_t tst;
-                tx_pipeline_get_stats(&txp, &tst);
-                rf10_stats_t stx = tst.txq;
-                float tx_fill_pct = (stx.cap ? (100.0f * (float)stx.count / (float)stx.cap) : 0.f);
-                
-                // optional: rates since last sample
-				static struct timespec tx_last_ts = {0};
-				static rf10_stats_t    tx_last_s  = {0};
-				double tx_rate_puts = 0.0, tx_rate_gets = 0.0;
-
-				struct timespec now;
-				clock_gettime(CLOCK_MONOTONIC, &now);
-				if (tx_last_ts.tv_sec != 0) {
-				double dt = (now.tv_sec - tx_last_ts.tv_sec) + (now.tv_nsec - tx_last_ts.tv_nsec)/1e9;
-				 	if (dt > 0.0) {
-				 		tx_rate_puts = (double)(stx.puts - tx_last_s.puts) / dt;
-				 		tx_rate_gets = (double)(stx.gets - tx_last_s.gets) / dt;
-				 	}
-				}
-				tx_last_ts = now; tx_last_s = stx;
-                
-                printw("Linux TX FIFO:\n");
-                printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu\n",
-                    stx.count, stx.cap, tx_fill_pct, stx.min_depth, stx.max_depth);
-                printw("    puts:%zu gets:%zu drops:%zu tO_put:%zu tO_get:%zu\n",
-                    stx.puts, stx.gets, stx.drops, stx.timeouts_put, stx.timeouts_get);
-                printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
-				    tx_rate_puts, tx_rate_gets);
-
-				// If you want to highlight trouble:
-				if (stx.min_depth == 0)          printw("    NOTE: Under-runs observed (producer late)\n");
-				if (stx.drops > 0)               printw("    NOTE: Overwrites occurred (producer faster than writer)\n");
-				if (stx.timeouts_put > 0)        printw("    NOTE: Producer timed out waiting to enqueue\n");
-				if (stx.timeouts_get > 0)        printw("    NOTE: Writer timed out waiting for frames\n");
-			
-                
-                
-                
-                rx_pipeline_stats_t rst;
-                rx_pipeline_get_stats(&rxp, &rst);
-                rf10_stats_t srx = rst.rxq;
-                float rx_fill_pct = (srx.cap ? (100.0f * (float)srx.count / (float)srx.cap) : 0.f);
-                
-                // optional: rates since last sample
-				static struct timespec rx_last_ts = {0};
-				static rf10_stats_t    rx_last_s  = {0};
-				double rx_rate_puts = 0.0, rx_rate_gets = 0.0;
-
-				if (rx_last_ts.tv_sec != 0) {
-				double dt = (now.tv_sec - rx_last_ts.tv_sec) + (now.tv_nsec - rx_last_ts.tv_nsec)/1e9;
-				 	if (dt > 0.0) {
-				 		rx_rate_puts = (double)(srx.puts - rx_last_s.puts) / dt;
-				 		rx_rate_gets = (double)(srx.gets - rx_last_s.gets) / dt;
-				 	}
-				}
-				rx_last_ts = now; rx_last_s = srx;
-                
-
-                printw("Linux RX FIFO:\n");
-                printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu\n",
-                    srx.count, srx.cap, rx_fill_pct, srx.min_depth, srx.max_depth);
-                printw("    puts:%zu gets:%zu drops:%zu tO_put:%zu tO_get:%zu\n",
-                    srx.puts, srx.gets, srx.drops, srx.timeouts_put, srx.timeouts_get);
-                printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
-				    rx_rate_puts, rx_rate_gets);
-                
-                // Same “trouble” hints, adapted to RX roles
-                if (srx.min_depth == 0)          printw("    NOTE: Under-runs observed (reader late)\n");
-                if (srx.drops > 0)               printw("    NOTE: Overwrites occurred (demod slower than reader)\n");
-                if (srx.timeouts_put > 0)        printw("    NOTE: Reader timed out waiting to enqueue\n");
-                if (srx.timeouts_get > 0)        printw("    NOTE: Demod timed out waiting for frames\n");
-
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (tx_last_ts.tv_sec != 0) {
+        double dt = (now.tv_sec - tx_last_ts.tv_sec) + (now.tv_nsec - tx_last_ts.tv_nsec)/1e9;
+            if (dt > 0.0) {
+                tx_rate_puts = (double)(stx.puts - tx_last_s.puts) / dt;
+                tx_rate_gets = (double)(stx.gets - tx_last_s.gets) / dt;
             }
-		} 
-		
+        }
+        tx_last_ts = now; tx_last_s = stx;
+        
+        printw("Linux TX FIFO:\n");
+        printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu\n",
+            stx.count, stx.cap, tx_fill_pct, stx.min_depth, stx.max_depth);
+        printw("    puts:%zu gets:%zu drops:%zu tO_put:%zu tO_get:%zu\n",
+            stx.puts, stx.gets, stx.drops, stx.timeouts_put, stx.timeouts_get);
+        printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
+            tx_rate_puts, tx_rate_gets);
+
+        // If you want to highlight trouble:
+        if (stx.min_depth == 0)          printw("    NOTE: Under-runs observed (producer late)\n");
+        if (stx.drops > 0)               printw("    NOTE: Overwrites occurred (producer faster than writer)\n");
+        if (stx.timeouts_put > 0)        printw("    NOTE: Producer timed out waiting to enqueue\n");
+        if (stx.timeouts_get > 0)        printw("    NOTE: Writer timed out waiting for frames\n");
+    
+        rx_pipeline_stats_t rst;
+        rx_pipeline_get_stats(&rxp, &rst);
+        rf10_stats_t srx = rst.rxq;
+        float rx_fill_pct = (srx.cap ? (100.0f * (float)srx.count / (float)srx.cap) : 0.f);
+        
+        // optional: rates since last sample
+        static struct timespec rx_last_ts = {0};
+        static rf10_stats_t    rx_last_s  = {0};
+        double rx_rate_puts = 0.0, rx_rate_gets = 0.0;
+
+        if (rx_last_ts.tv_sec != 0) {
+        double dt = (now.tv_sec - rx_last_ts.tv_sec) + (now.tv_nsec - rx_last_ts.tv_nsec)/1e9;
+            if (dt > 0.0) {
+                rx_rate_puts = (double)(srx.puts - rx_last_s.puts) / dt;
+                rx_rate_gets = (double)(srx.gets - rx_last_s.gets) / dt;
+            }
+        }
+        rx_last_ts = now; rx_last_s = srx;
+        
+        printw("Linux RX FIFO:\n");
+        printw("    depth: %zu/%zu (%.0f%%), min:%zu max:%zu\n",
+            srx.count, srx.cap, rx_fill_pct, srx.min_depth, srx.max_depth);
+        printw("    puts:%zu gets:%zu drops:%zu tO_put:%zu tO_get:%zu\n",
+            srx.puts, srx.gets, srx.drops, srx.timeouts_put, srx.timeouts_get);
+        printw("    rate: puts %.1f/s, gets %.1f/s  (expect ~100 fps @ 10ms)\n",
+            rx_rate_puts, rx_rate_gets);
+        
+        // Same “trouble” hints, adapted to RX roles
+        if (srx.min_depth == 0)          printw("    NOTE: Under-runs observed (reader late)\n");
+        if (srx.drops > 0)               printw("    NOTE: Overwrites occurred (demod slower than reader)\n");
+        if (srx.timeouts_put > 0)        printw("    NOTE: Reader timed out waiting to enqueue\n");
+        if (srx.timeouts_get > 0)        printw("    NOTE: Demod timed out waiting for frames\n");
+
 		char key = 0;
 		key = getch();
 		
@@ -3342,88 +3213,6 @@ void monitor_modem_status(sys_st *sys)
 			rf10_fifo_reset_stats(&txp.txq);
             rf10_fifo_reset_stats(&rxp.rxq);
 		}
-		
-		// if(key == 't') // Press 't' to toggle TX state and RFFE
-		// {
-		// 	// if (nbfm_rx_active) 
-		// 	// {
-		// 	// 	nbfm_rx_active = false;
-		// 	// 	HW_LOCK();
-		// 	// 	cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);	
-		// 	//     HW_UNLOCK();
-		// 	// }
-        //     if (nbfm_rx_active) {
-        //         nbfm_rx_active = false;
-        //         HW_LOCK();
-        //         // Force the DMA/driver to IDLE before changing direction
-        //         caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // IDLE
-        //         cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-        //         HW_UNLOCK();
-        //         usleep(2000); // small settle
-        //     }
-			
-		// 	if (!nbfm_tx_active)
-		// 	{
-		// 		HW_LOCK();
-		// 		caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_tx_lowpass);
-		// 		//caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_tx_hipass);
-        //         cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
-        //         // a short sleep so that the tx_fifo gets filled already
-        //         struct timespec ts = { .tv_sec = 0, .tv_nsec = 30*1000*1000 }; // 30 ms
-        //         nanosleep(&ts, NULL);
-        //         caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)3); // TX
-		// 		HW_UNLOCK();
-
-		// 		__sync_synchronize();          // memory barrier
-        //         nbfm_tx_active = true;         // tell the writer thread LAST
-		// 	}
-		// 	else 
-		// 	{
-		// 		nbfm_tx_active = false;
-		// 		__sync_synchronize();
-				
-		// 		HW_LOCK();
-		// 		caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
-		// 		cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-		// 		caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_low_power);
-		// 		HW_UNLOCK();
-		// 	}
-		// }
-		
-		// if(key == 'r') // Press 'r' to toggle RX state and RFFE
-		// {
-		// 	if (nbfm_tx_active)
-		// 	{
-		// 		nbfm_tx_active = false;
-		// 		__sync_synchronize();
-				
-		// 		HW_LOCK();
-		// 		caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // idle
-		// 		cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
-		// 		caribou_fpga_set_io_ctrl_mode (&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_low_power);
-		// 		HW_UNLOCK();
-		// 	}
-				
-		// 	if (!nbfm_rx_active) {
-        //         nbfm_rx_active = true;
-        //         HW_LOCK();
-        //         caribou_fpga_set_io_ctrl_mode(&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_rx_lowpass);
-        //         //caribou_fpga_set_io_ctrl_mode(&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_rx_hipass);
-        //         cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, true);
-        //         caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)1); // <-- add this
-        //         //caribou_smi_set_driver_streaming_state(&sys->smi, /* 0=idle 1=RX09 2=RX24 3=TX */(smi_stream_state_en)2); // <-- add this
-        //         HW_UNLOCK();
-        //     } else {
-        //         nbfm_rx_active = false;
-        //         HW_LOCK();
-        //         cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-        //         if (!nbfm_tx_active) {
-        //             caribou_smi_set_driver_streaming_state(&sys->smi, (smi_stream_state_en)0); // <-- add this
-        //         }
-        //         caribou_fpga_set_io_ctrl_mode(&sys->fpga, debug, caribou_fpga_io_ctrl_rfm_low_power);
-        //         HW_UNLOCK();
-        //     }
-		// }
 
         // --- T: toggle TX ---
         if (key == 't') {
@@ -3458,40 +3247,6 @@ void monitor_modem_status(sys_st *sys)
     cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
     HW_UNLOCK();
     usleep(30 * 1000);
-
-    // // tx stopping
-	// nbfm_tx_active = false;
-    // tx_ctrl.active = false;
-    // dsp_ctrl.active = false;
-    // rf10_fifo_stop(&txq);
-    // pthread_join(tx_thread, NULL);
-    // pthread_join(dsp_thread, NULL);
-    // rf10_fifo_destroy(&txq);
-    // if (tx_ctrl.iq4m) free(tx_ctrl.iq4m);
-    // if (tx_ctrl.a48k) free(tx_ctrl.a48k);
-    // if (tx_ctrl.fm)   nbfm4m_destroy(tx_ctrl.fm);
-    // if (tx_ctrl.mic)  alsa48k_destroy(tx_ctrl.mic);
-
-    // // rx stopping
-	// nbfm_rx_active = false;
-	// rx_ctrl.active = false;
-    // dm.active = false;
-    // aw.active = false;
-    // rf10_fifo_stop(&rxq);
-    // aud10_fifo_stop(&afifo);
-    // pthread_join(demod_th, NULL);
-    // pthread_join(aw_th, NULL);
-    // pthread_join(rx_thread, NULL);
-    // rf10_fifo_destroy(&rxq);
-    // aud10_fifo_destroy(&afifo);
-    
-    // if (dm.pcm) snd_pcm_close(dm.pcm);
-
-	// pthread_cancel(tx_thread);
-    // pthread_cancel(rx_thread);
-    // pthread_cancel(dsp_thread);
-    // pthread_cancel(demod_th);
-    // pthread_cancel(aw_th);
     
     // put driver idle first
     smi_idle(sys);
