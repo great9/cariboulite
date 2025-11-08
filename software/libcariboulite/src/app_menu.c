@@ -1020,7 +1020,8 @@ static void* audio_writer_thread(void* arg){
     pthread_setname_np(pthread_self(),"audio_writer_thread");
     
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(42,-1); 
+    //set_rt_and_affinity_prio(42,-1); 
+    set_rt_and_affinity_prio(46,0);
 
     // optional: make period/blocking behavior nicer
     while(a->active){
@@ -1364,7 +1365,8 @@ static void* dsp_producer_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(), "dsp_producer_thread");
     //set_rt_and_affinity();   // make sure this logs failures
-    set_rt_and_affinity_prio(45,-1);
+    //set_rt_and_affinity_prio(45,-1);
+    set_rt_and_affinity_prio(40,0);
 
     dsp_producer_ctrl_t* ctrl = (dsp_producer_ctrl_t*)arg;
     if (!ctrl || !ctrl->tx || !ctrl->tx->fm || !ctrl->fifo ||
@@ -1474,7 +1476,9 @@ static void* rx_reader_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(),"rx_reader_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(30, -1); 
+    //set_rt_and_affinity_prio(30, -1);
+    // Highest prio; reader must never be blocked by DSP/ALSA
+    set_rt_and_affinity_prio(70, 2);   // falls back to CPU0 if missing 
 
     rx_reader_ctrl_st* ctrl = (rx_reader_ctrl_st*)arg;
     caribou_smi_st *smi = &ctrl->radio->sys->smi;
@@ -1580,7 +1584,7 @@ static int alsa_open_playback(snd_pcm_t **ppcm,
 
     // make buffer a bit deeper to avoid XRUN storms
     snd_pcm_uframes_t period = 480;    // 10 ms
-    snd_pcm_uframes_t buffer = 9600;   // 200 ms
+    snd_pcm_uframes_t buffer = 2400;   // 50 ms
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL);
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
 
@@ -1762,7 +1766,7 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
 
     // FIFOs
     rf10_fifo_init(&p->rxq,  /*cap=*/128, /*drop_oldest_on_full=*/true);
-    aud10_fifo_init(&p->afifo, /*cap=*/256);
+    aud10_fifo_init(&p->afifo, /*cap=*/24);
 
     // Open ALSA playback
     unsigned rate=0, channels=0;
@@ -1791,6 +1795,7 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
     p->demod.pcm_gain        = par->pcm_gain;
     p->demod.pcm_total_frames= 0;
     p->demod.pcm_channels    = p->aw.channels;
+    p->demod.pcm_rate        = rate;
 
     if (pthread_create(&p->demod_thread, NULL, nbfm_demod_thread, &p->demod) != 0)
         return -4;
@@ -1965,7 +1970,9 @@ static void* nbfm_demod_thread(void* arg)
 {
     pthread_setname_np(pthread_self(),"nbfm_demod_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(41,-1);             
+    //set_rt_and_affinity_prio(41,-1);
+    // Mid-high: below reader, above ALSA writer
+    set_rt_and_affinity_prio(55,1);             
     
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
     if (!c || !c->fifo_in || !c->pcm) return NULL;
@@ -2076,10 +2083,10 @@ static void* nbfm_demod_thread(void* arg)
             const int    upd_every_inputs = 500;      // ≈10 ms @ 50 kS/s
             const double alpha = 0.05;                // EMA smoothing on depth (0.02..0.1)
             const double ki    = 2.0e-4;              // integral gain per update (start small)
-            const double corr_ppm_cap = 1.0e-3;       // ±1000 ppm hard clamp
-            const double corr_ppm_slew = 2.0e-5;      // ±20 ppm per update slew limit
+            const double corr_ppm_cap = 3.0e-4;       // ±300 ppm hard clamp
+            const double corr_ppm_slew = 1.0e-5;      // ±10 ppm per update slew limit
             const double target_fill = 0.50;          // 50% of capacity
-            const double deadband = 0.02;             // ±2% fill deadband to avoid hunting
+            const double deadband = 0.01;             // ±2% fill deadband to avoid hunting
 
             // Servo tuning
             //const double kp = 1.0e-3;                    // 8e-4..1.5e-3
@@ -2131,7 +2138,7 @@ static void* nbfm_demod_thread(void* arg)
                 if (fill < 0.05) corr48 = fmax(corr48,  5e-4);  // nudge uprate by 500 ppm
 
                 // (for your log) print ppm not fraction
-                fprintf(stderr, "corr=%.1f ppm  fill=%.0f%%\n", corr48*1e6, 100.0*fill);
+                //fprintf(stderr, "corr=%.1f ppm  fill=%.0f%%\n", corr48*1e6, 100.0*fill);
             }
 
             // Interpolation endpoints for this 50k interval
@@ -2218,7 +2225,8 @@ static void* tx_writer_thread_func(void* arg)
 {
     pthread_setname_np(pthread_self(), "tx_writer_thread");
     //set_rt_and_affinity();
-    set_rt_and_affinity_prio(42,-1);
+    //set_rt_and_affinity_prio(42,-1);
+    set_rt_and_affinity_prio(48,0);
 
 
     tx_writer_ctrl_st* ctrl = (tx_writer_ctrl_st*)arg;
