@@ -2073,69 +2073,6 @@ static void* nbfm_demod_thread(void* arg)
                 have_prev50 = 1;
             }
             pi50 = i50; pq50 = q50;
-
-            // --- 50k -> 48k fixed 24/25 with linear interpolation ---
-            // y_prev_50k = y_curr_50k;
-            // y_curr_50k = y50;
-            // acc -= M;
-            // while (acc <= -M) acc += M;  // keep in [-M+1 .. 0]                                  // one 50k input arrived
-            // while (acc <= 0) {
-            //     // linear interp between last two 50k samples
-            //     float frac = (float)(acc + M) / (float)M;
-            //     if (frac < 0.f) frac = 0.f; else if (frac > 1.f) frac = 1.f;
-            //     float y_lin = y_prev_50k + frac * (y_curr_50k - y_prev_50k);
-
-            //     // DC block @ 48k
-            //     float x = y_lin;
-            //     float y = (x - x_prev_audio) + dc_a * dc_y;
-            //     x_prev_audio = x;
-            //     dc_y = y;
-            //     if (fabsf(dc_y) < 1e-20f) dc_y = 0.0f;
-
-            //     // de-emphasis @ 48k
-            //     float yd = deemph_48k(y, &deemph_state, c->deemph_tau);
-            //     if (fabsf(deemph_state) < 1e-20f) deemph_state= 0.0f;
-
-            //     // gentle audio LPF (~3.2 kHz) to tame residual hiss
-            //     lpf_y = lpf_a * lpf_y + lpf_b * yd;
-            //     float ya = lpf_y;
-            //     if (fabsf(lpf_y) < 1e-20f) lpf_y = 0.0f;
-
-            //     // to int16 with gain
-            //     float s = ya * c->pcm_gain;
-            //     if (s >  32767.f) s =  32767.f;
-            //     if (s < -32768.f) s = -32768.f;
-            //     audio_10ms[nout++] = (int16_t)lrintf(s);
-
-            //     acc += L;
-
-            //     if (nout == 480) {
-            //         //write_exact_alsa_16(c->pcm, audio_10ms, 480, c->pcm_channels);
-            //         aud10_frame_t frm;
-            //         memcpy(frm.pcm, audio_10ms, sizeof(audio_10ms));
-            //         aud10_fifo_put(c->afifo_out, &frm, /*timeout_ms=*/3);  // short wait; writer will smooth
-            //         // if timeout is a positive number, the fifo is not filling up...
-            //         // if timeout is a negative number, the fifo will fill up eventualy...
-            //         // either way after a few seconds the audio will have a periodic drop 
-            //         c->pcm_total_frames += 480;
-            //         nout = 0;
-
-            //         // heartbeat once per ~1 s
-            //         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            //         uint64_t ms = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
-            //         if (!last_log_ms) last_log_ms = ms;
-            //         if (ms - last_log_ms >= 1000) {
-            //             fprintf(stderr,
-            //                 "DEMOD: frames=%llu (%.1fs) ALSA=%s ch=%u  mid=50k  ratio=24/25\n",
-            //                 (unsigned long long)c->pcm_total_frames,
-            //                 (double)c->pcm_total_frames / (double)c->pcm_rate,
-            //                 pcm_state_name(snd_pcm_state(c->pcm)),
-            //                 c->pcm_channels);
-            //             last_log_ms = ms;
-            //         }
-            //     }
-            // }
-            // if (acc > L) acc %= L;  // prevent overflow
             
             // --- 50k → 48k adaptive resampler (fractional-step with tiny PLL/servo) ---
             // --- 50k → 48k adaptive resampler (correct: ≤1 output per 50k input) ---
@@ -2160,26 +2097,6 @@ static void* nbfm_demod_thread(void* arg)
             
             // Prime: let FIFO rise near target before engaging strongly
             static int primed = 0;
-
-            // Update correction ~every 10 ms of 50k inputs (here each RF frame start or use a small counter)
-            // if (++servo_tick >= 500) {                   // 500 inputs @50k ≈ 10 ms
-            //     servo_tick = 0;
-            //     size_t acnt=0, acap=0;
-            //     aud10_fifo_peek_depth(c->afifo_out, &acnt, &acap);
-            //     const double target = 0.50 * (double)acap;   // aim ~50% fill
-            //     const double err    = (double)acnt - target; // +err => slow down production
-
-            //     // integrator with tiny leak for damping
-            //     corr48 = 0.9999 * corr48 - kp * err;
-
-            //     // clamp correction to ±5% (temporarily wide to find true steady-state)
-            //     if (corr48 >  5.0e-2) corr48 =  5.0e-2;
-            //     if (corr48 < -5.0e-2) corr48 = -5.0e-2;
-
-            //     // emergency brake if very full
-            //     const double fill = (double)acnt / (double)acap;
-            //     if (fill > 0.90) corr48 = -5.0e-2;          // slow production
-            // }
 
             // Update every ~10 ms worth of 50k inputs
             if (++servo_tick >= upd_every_inputs) {
