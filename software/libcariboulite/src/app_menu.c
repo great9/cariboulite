@@ -1050,7 +1050,10 @@ typedef struct {
     float               deemph_tau;  // e.g., 75e-6 (NA) or 50e-6 (EU)
     float               fs_rf;       // 4e6
     float               fs_audio;    // 48000
-
+    volatile bool       reset;       // set true to force state re-init
+    int                 prime_blocks_10ms; // e.g., 20 blocks = 200 ms @ 48k
+    bool                priming;     // internal flag
+    
     // state
     float               deemph_y;
     int16_t             last_i, last_q; // FM discrim previous sample
@@ -1786,16 +1789,19 @@ int rx_pipeline_init(rx_pipeline_t* p, sys_st* sys,
         return -3;
 
     // Demod setup
-    p->demod.active          = true;
-    p->demod.fifo_in         = &p->rxq;
-    p->demod.afifo_out       = &p->afifo;
-    p->demod.fs_rf           = par->fs_rf;      // 4e6
-    p->demod.fs_audio        = par->fs_audio;   // 48e3
-    p->demod.deemph_tau      = par->deemph_tau_s;
-    p->demod.pcm_gain        = par->pcm_gain;
-    p->demod.pcm_total_frames= 0;
-    p->demod.pcm_channels    = p->aw.channels;
-    p->demod.pcm_rate        = rate;
+    p->demod.reset             = true;
+    p->demod.prime_blocks_10ms = 20;    // 20 * 10ms = 200 ms
+    p->demod.priming           = true;
+    p->demod.active            = true;
+    p->demod.fifo_in           = &p->rxq;
+    p->demod.afifo_out         = &p->afifo;
+    p->demod.fs_rf             = par->fs_rf;      // 4e6
+    p->demod.fs_audio          = par->fs_audio;   // 48e3
+    p->demod.deemph_tau        = par->deemph_tau_s;
+    p->demod.pcm_gain          = par->pcm_gain;
+    p->demod.pcm_total_frames  = 0;
+    p->demod.pcm_channels      = p->aw.channels;
+    p->demod.pcm_rate          = rate;
 
     if (pthread_create(&p->demod_thread, NULL, nbfm_demod_thread, &p->demod) != 0)
         return -4;
@@ -1849,6 +1855,10 @@ int rx_pipeline_start(rx_pipeline_t* p)
     pthread_create(&p->rx_thread, NULL, rx_reader_thread_func, &p->rx_ctrl);
 
     __sync_synchronize();
+
+    p->demod.prime_blocks_10ms = 8;   // gentle start whenever RX is toggled on
+    p->demod.reset = true;            // demod thread will reinit on next loop
+
     nbfm_rx_active = true;
 
     p->running = true;
@@ -1907,6 +1917,43 @@ void rx_pipeline_destroy(rx_pipeline_t* p)
     rf10_fifo_destroy(&p->rxq);
 
     p->inited = false;
+}
+
+// --- helper to reinitialize all demod state (C version) ---
+static void reinit_demod_state(
+    float *pi50, float *pq50, int *have_prev50,
+    float *dc_y, float *x_prev_audio,
+    float *deemph_state, float *lpf_y,
+    float *y_prev_50k, float *y_curr_50k,
+    double *phase48, double *corr48,
+    double *depth_ema, int *servo_tick,
+    int *primed, int *nout,
+    int *priming_blocks_left,
+    nbfm_demod_ctrl_t *c)
+{
+    // previous complex @50k
+    *pi50 = 0.0f; *pq50 = 0.0f; *have_prev50 = 0;
+
+    // 48k chain state
+    *dc_y = 0.0f; *x_prev_audio = 0.0f;
+    *deemph_state = 0.0f;
+    *lpf_y = 0.0f;
+    *y_prev_50k = 0.0f;
+    *y_curr_50k = 0.0f;
+
+    // resampler servo / accumulator
+    *phase48 = 0.0;
+    *corr48 = 0.0;
+    *depth_ema = 0.0;
+    *servo_tick = 0;
+    *primed = 0;
+
+    // audio packer
+    *nout = 0;
+
+    // priming counter
+    *priming_blocks_left = c->prime_blocks_10ms;
+    c->priming = (*priming_blocks_left > 0);
 }
 
 // --- simple 1st-order de-emphasis (continuous-time tau) at fs samples/s
@@ -1969,11 +2016,8 @@ static inline float fast_atan2f_small(float y, float x)
 static void* nbfm_demod_thread(void* arg)
 {
     pthread_setname_np(pthread_self(),"nbfm_demod_thread");
-    //set_rt_and_affinity();
-    //set_rt_and_affinity_prio(41,-1);
-    // Mid-high: below reader, above ALSA writer
-    set_rt_and_affinity_prio(55,1);             
-    
+    set_rt_and_affinity_prio(55,1);
+
     nbfm_demod_ctrl_t* c = (nbfm_demod_ctrl_t*)arg;
     if (!c || !c->fifo_in || !c->pcm) return NULL;
 
@@ -1986,8 +2030,8 @@ static void* nbfm_demod_thread(void* arg)
     const float K_norm = fs_mid / (2.0f * (float)M_PI * f_dev);   // scale dphi -> ~±1 at ±dev
 
     // 50k -> 48k via fixed rational 24/25 (exact)
-    const int   L = 24, M = 25;
-    int         acc = 0;                     // integer accumulator (drift-free)
+    const int   L = 24, M = 25;              // kept for reference (acc not used)
+    int         acc = 0;                     // (unused but harmless)
     float       y_prev_50k = 0.0f, y_curr_50k = 0.0f;
 
     // Optional vector limiter
@@ -2011,18 +2055,56 @@ static void* nbfm_demod_thread(void* arg)
     float pi50 = 0.0f, pq50 = 0.0f;
     int   have_prev50 = 0;
 
+    // --- adaptive 50k -> 48k servo (NON-static so reset works) ---
+    double phase48 = 0.0;     // in [0..1)
+    double corr48  = 0.0;     // small fractional correction (unitless)
+    double depth_ema = 0.0;   // smoothed FIFO depth
+    int    servo_tick = 0;
+    int    primed = 0;
+
+    // audio packer
+    int    nout = 0;          // NOTE: int (matches reinit_demod_state signature)
+    int    priming_blocks_left = 0;
+
+    // ---------------- Working buffers ----------------
+    int16_t audio_10ms[480];  // 10 ms @ 48 kHz
+    size_t  a10_len = 0;      // (unused: you can remove if you like)
+
     // I&D accumulators on I and Q (do NOT demod at 4M)
     float ai1 = 0.0f, aq1 = 0.0f; int cnt1 = 0;
     float ai2 = 0.0f, aq2 = 0.0f; int cnt2 = 0;
 
-    // ALSA 10 ms block
-    int16_t audio_10ms[480];
-    size_t  nout = 0;
-
     // heartbeat
     uint64_t last_log_ms = 0;
 
+    // ------------- Initialize once -------------
+    if (c->prime_blocks_10ms <= 0) c->prime_blocks_10ms = 8; // sensible default
+    c->reset = true;  // force clean start
+    reinit_demod_state(&pi50,&pq50,&have_prev50,
+                       &dc_y,&x_prev_audio,
+                       &deemph_state,&lpf_y,
+                       &y_prev_50k,&y_curr_50k,
+                       &phase48,&corr48,
+                       &depth_ema,&servo_tick,
+                       &primed,&nout,
+                       &priming_blocks_left, c);
+    c->reset = false;
+
     while (c->active) {
+
+        // allow external reset (e.g., after first-start flicker or frequency change)
+        if (c->reset) {
+            reinit_demod_state(&pi50,&pq50,&have_prev50,
+                               &dc_y,&x_prev_audio,
+                               &deemph_state,&lpf_y,
+                               &y_prev_50k,&y_curr_50k,
+                               &phase48,&corr48,
+                               &depth_ema,&servo_tick,
+                               &primed,&nout,
+                               &priming_blocks_left, c);
+            c->reset = false;
+        }
+
         rf10_frame_t frm;
         if (!rf10_fifo_get(c->fifo_in, &frm, -1)) continue;
 
@@ -2061,38 +2143,23 @@ static void* nbfm_demod_thread(void* arg)
             if (have_prev50) {
                 const float re = i50 * pi50 + q50 * pq50;
                 const float im = q50 * pi50 - i50 * pq50;
-                //const float dphi = atan2f(im, re);     // [-π, π]
-                //const float dphi = fast_atan2f(im, re);
                 const float dphi = fast_atan2f_small(im, re);
                 y50 = dphi * K_norm;                   // normalize to ~±1 @ ±dev
             } else {
                 have_prev50 = 1;
             }
             pi50 = i50; pq50 = q50;
-            
+
             // --- 50k → 48k adaptive resampler (fractional-step with tiny PLL/servo) ---
-            // --- 50k → 48k adaptive resampler (correct: ≤1 output per 50k input) ---
-            // Persistent state
-            static double phase48 = 0.0;                 // in [0..1)
-            static double corr48  = 0.0;                 // small fractional correction (unitless)
-            static double depth_ema = 0.0;        // smoothed FIFO depth
-            static int    servo_tick = 0;
-            
             // Nominal outputs per 50k input (r < 1 for downsampling)
             const double r_nom = 48000.0 / 50000.0;      // 0.96
-            const int    upd_every_inputs = 500;      // ≈10 ms @ 50 kS/s
-            const double alpha = 0.05;                // EMA smoothing on depth (0.02..0.1)
-            const double ki    = 2.0e-4;              // integral gain per update (start small)
-            const double corr_ppm_cap = 3.0e-4;       // ±300 ppm hard clamp
-            const double corr_ppm_slew = 1.0e-5;      // ±10 ppm per update slew limit
-            const double target_fill = 0.50;          // 50% of capacity
-            const double deadband = 0.01;             // ±2% fill deadband to avoid hunting
-
-            // Servo tuning
-            //const double kp = 1.0e-3;                    // 8e-4..1.5e-3
-            
-            // Prime: let FIFO rise near target before engaging strongly
-            static int primed = 0;
+            const int    upd_every_inputs = 500;         // ≈10 ms @ 50 kS/s
+            const double alpha = 0.05;                   // EMA smoothing
+            const double ki    = 2.0e-4;                 // integral gain
+            const double corr_ppm_cap  = 3.0e-4;         // ±300 ppm clamp
+            const double corr_ppm_slew = 1.0e-5;         // ±10 ppm per update
+            const double target_fill = 0.50;             // 50% of capacity
+            const double deadband    = 0.01;             // ±2% fill deadband
 
             // Update every ~10 ms worth of 50k inputs
             if (++servo_tick >= upd_every_inputs) {
@@ -2114,8 +2181,7 @@ static void* nbfm_demod_thread(void* arg)
                 double err = 0.0;
                 if (primed) {
                     const double target = target_fill * (double)acap;
-                    const double err_raw = (double)depth_ema - target; // +err => we’re overfilling
-                    // deadband -> zero out small errors to avoid audible dither
+                    const double err_raw = (double)depth_ema - target; // +err => overfilling
                     if (fabs(err_raw) > deadband * (double)acap)
                         err = err_raw;
                 }
@@ -2133,12 +2199,9 @@ static void* nbfm_demod_thread(void* arg)
                 if (corr48 >  corr_ppm_cap) corr48 =  corr_ppm_cap;
                 if (corr48 < -corr_ppm_cap) corr48 = -corr_ppm_cap;
 
-                // optional: emergency brake if nearly full/empty (still gentle)
-                if (fill > 0.95) corr48 = fmin(corr48, -5e-4);  // nudge downrate by 500 ppm
-                if (fill < 0.05) corr48 = fmax(corr48,  5e-4);  // nudge uprate by 500 ppm
-
-                // (for your log) print ppm not fraction
-                //fprintf(stderr, "corr=%.1f ppm  fill=%.0f%%\n", corr48*1e6, 100.0*fill);
+                // emergency nudges
+                if (fill > 0.95) corr48 = fmin(corr48, -5e-4);
+                if (fill < 0.05) corr48 = fmax(corr48,  5e-4);
             }
 
             // Interpolation endpoints for this 50k interval
@@ -2151,11 +2214,10 @@ static void* nbfm_demod_thread(void* arg)
 
             // If we crossed 1.0, emit exactly one 48k sample at that crossing
             if (phase48 >= 1.0) {
-                // crossing fractional position within current 50k interval
                 const double frac = (phase48 - 1.0) / r;    // ∈ [0..1)
                 float y_lin = y_prev_50k + (float)frac * (y_curr_50k - y_prev_50k);
 
-                // === 48k audio chain (unchanged) ===
+                // === 48k audio chain ===
                 float x = y_lin;
                 float y = (x - x_prev_audio) + dc_a * dc_y;
                 x_prev_audio = x;
@@ -2343,6 +2405,12 @@ int rx_pipeline_set_freq(rx_pipeline_t* p, double freq_hz)
     HW_LOCK();
     cariboulite_radio_set_frequency(p->radio, true, &freq_hz);
     HW_UNLOCK();
+    
+    // If running, gently reset demod so clicks/flicker are avoided post-retune
+    if (p->running) {
+        p->demod.prime_blocks_10ms = 4;  // ~40 ms is often enough on retunes
+        p->demod.reset = true;
+    }
     return 0;
 }
 
