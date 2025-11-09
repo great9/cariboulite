@@ -1180,8 +1180,8 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
             //.loopback_enable = 0,
             .drv_strength = at86rf215_iq_drive_current_4ma,
             .common_mode_voltage = at86rf215_iq_common_mode_v_ieee1596_1v2,
-            //.tx_control_with_iq_if = !radio->cw_output,
-            .tx_control_with_iq_if = radio->tx_control_with_iq_if, // we always use the modem tx control
+            .tx_control_with_iq_if = !radio->cw_output,
+            //.tx_control_with_iq_if = radio->tx_control_with_iq_if, // we always use the modem tx control
             .radio09_mode = at86rf215_iq_if_mode,
             .radio24_mode = at86rf215_iq_if_mode,
             .clock_skew = at86rf215_iq_clock_data_skew_2_906ns,
