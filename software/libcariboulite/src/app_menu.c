@@ -147,42 +147,33 @@ static inline uint64_t mono_ns(void){
     return (uint64_t)ts.tv_sec*1000000000ull + ts.tv_nsec;
 }
 
-// static inline void set_rt_and_affinity_prio(int prio, int cpu){
-//     struct sched_param sp = { .sched_priority = prio };
-//     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-// #ifdef __linux__
-//     cpu_set_t set; CPU_ZERO(&set);
-//     CPU_SET(cpu >= 0 ? cpu : 0, &set);
-//     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-// #endif
-//     mlockall(MCL_CURRENT | MCL_FUTURE);
-// }
-
-static inline void set_rt_and_affinity_prio(int prio, int cpu_req)
+static int set_rt_and_affinity_prio(int prio, int cpu_req)
 {
-    // try RT, but fall back silently
     struct sched_param sp = { .sched_priority = prio };
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-        // Fallback to normal scheduling if we don't have CAP_SYS_NICE
         sp.sched_priority = 0;
         pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
     }
 
-#ifdef __linux__
-    // Clamp CPU id for small boards (Pi Zero has only CPU 0)
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 1;
     int cpu = (cpu_req >= 0) ? cpu_req : 0;
-    if (cpu >= ncpu) cpu = 0;               // clamp to CPU0 if out of range
+    if (cpu >= ncpu) cpu = (int)(ncpu - 1);
 
-    cpu_set_t set; CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    // If this fails (EINVAL/EPERM), just proceed with default affinity
-    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        fprintf(stderr, "[affinity] pid=%ld th=%lu prio=%d cpu_req=%d FAILED: %s\n",
+                (long)getpid(), (unsigned long)pthread_self(), prio, cpu_req, strerror(rc));
+        return -1;
+    }
+#ifdef __linux__
+    int on = sched_getcpu();
+    fprintf(stderr, "[affinity] th=%lu prio=%d pinned to CPU %d/%ld\n",
+            (unsigned long)pthread_self(), prio, on, ncpu);
 #endif
-
-    // If mlockall fails on low-RAM systems, ignore and keep going
     mlockall(MCL_CURRENT | MCL_FUTURE);
+    return 0;
 }
 
 static inline void set_rt_and_affinity(void)
@@ -2727,7 +2718,7 @@ void monitor_modem_status(sys_st *sys)
 	initscr(); // Initialize ncurses mode
 	cbreak();
 	noecho();
-	timeout(100);
+	timeout(200);
         
 	double frequency = 430100000; // Default frequency in Hz
 	int tx_power     = -3;	      // Default power in dBm
