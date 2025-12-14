@@ -46,7 +46,7 @@ Save the file and reboot
 ###Install linux kernel header files:
 
 ```sudo apt install linux-headers-rpi-v8```
->Note: I think this step is only required if you want build SDR++.
+>Note: I think this step is required when you have to rebuild the smi driver and if you want build SDR++.
 
 ###Monitoring the Pi's activity
 The next steps will often take a while, during which you might want to periodically check that everything is still moving along.
@@ -84,7 +84,7 @@ Or:
 git clone https://github.com/Habraken/SoapySDR.git
 git clone https://github.com/Habraken/SoapyRemote.git
 ```
-The following library is not available by default and SoapyRemakemote will complain but not fail:
+The following library not available by default and SoapyRemakemote will complain but not fail:
 
 ```
 sudo apt install libavahi-client-dev
@@ -118,6 +118,12 @@ Or if you don't want to patch yourself:
 
 ```
 git clone https://github.com/Habraken/cariboulite.git
+```
+
+To make the nbfm_tx and nbfm_rx examples work you also need to install the dev tools for ALSA:
+
+```
+sudo apt install -y libasound2-dev pkg-config
 ```
 
 Before you can install anything make the following three changes to `~/src/cariboulite/driver/smi_stream_dev.c`.
