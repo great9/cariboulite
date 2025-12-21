@@ -234,7 +234,14 @@ Then in the cariboulite directory:
 ```
 ./install.sh
 ```
-This takes ‘a while’ on a Pi0. At a certain point the script will ask if you want to `install SoapySDR`, if you did not install it before. Say `Yes`. After the script has completed, reboot the Pi. Now we need to check with SMI driver is working correctly.
+This takes ‘a while’ on a Pi0. At a certain point the script will ask if you want to `install SoapySDR`, if you did not install it before. Say `Yes`. 
+
+After the script has completed, reboot the Pi. 
+```
+sudo reboot
+```
+
+Now we need to check with SMI driver is working correctly.
 
 ```
 lsmod | grep smi
