@@ -215,6 +215,13 @@ Then Hit Ctl+W and type ‘smi_stream_dev_remove’ and change the line with the
  }
 ```
 
+Instead of making the changes above yourself, you could also 'checkout' one of my recent feature branches, that has these chnages applied already. In addtion you get my 'Monitor Modem Status and NBFM TX and RX options:
+
+```
+cd ~/src/cariboulite
+git checkout feature/nbfm_rx
+```
+
 In the `cariboulite/driver` directory:
 
 ```
