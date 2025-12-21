@@ -3,6 +3,7 @@ All of the steps for Bookworm still apply, however there was a policy change wit
 - mlock
 - RT scheduling
 - unprivileged DMA-style workloads
+
 Therefore some addtional steps on Trixie are required so that the cariboulite_test_app will run without the sudo -E option.
 
 ##Step 1
