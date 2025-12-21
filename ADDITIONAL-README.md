@@ -1,3 +1,52 @@
+#Install CaribouLite with Raspberry pi OS Trixie (64bit) [WIP]
+All of the steps for Bookworm still apply, however there was a policy change with Debian 13 that tightend defaults for
+- mlock
+- RT scheduling
+- unprivileged DMA-style workloads
+Therefore some addtional steps on Trixie are required so that the cariboulite_test_app will run without the sudo -E option.
+
+##Step 1
+```
+bash
+
+sudo mkdir -p /etc/systemd/system.conf.d
+```
+```
+bash
+
+sudo tee /etc/systemd/system.conf.d/99-memlock.conf >/dev/null <<'EOF'
+[Manager]
+DefaultLimitMEMLOCK=infinity
+EOF
+```
+##Step 2
+```
+bash
+
+sudo mkdir -p /etc/systemd/user.conf.d
+```
+```
+bash
+
+sudo tee /etc/systemd/user.conf.d/99-memlock.conf >/dev/null <<'EOF'
+[Manager]
+DefaultLimitMEMLOCK=infinity
+EOF
+```
+##Step 3
+```
+bash
+
+sudo reboot
+```
+##Step 4
+```
+bash
+
+ulimit -l
+cat /proc/self/limits | grep -i "Max locked memory"
+```
+
 #Install CaribouLite with Raspberry Pi OS Bookworm (Lite) (64bit)
 
 My goal is to install the cariboulite on a Raspberry Pi0_2W and/or a Pi4. Requirements:  
