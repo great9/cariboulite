@@ -449,7 +449,7 @@ Install dependencies for SDR++:
 sudo apt install libglfw3 // maybe  not needed.
 sudo apt install libglfw3-dev
 sudo apt install libfftw3-dev
-sudo apt install libvolk-dev
+sudo apt install libvolk-dev // libvolk2-dev for bookworm?
 sudo apt install libvolk-bin
 sudo apt install libzstd-dev
 sudo apt install librtaudio-dev
