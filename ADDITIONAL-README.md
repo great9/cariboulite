@@ -350,12 +350,77 @@ FF E0 FF D2 C0 12 C0 1A  C0 DA FF 02 C0 00 C0 EE  |  ................
 C0 C0 C0 C4 C0 FA C0 E6  C0 30 C0 22 C0 C0 C0 CC  |  .........0.".... 
 05-01 14:00:45.055   644   648 E CARIBOULITE Radio cariboulite_radio_read_samples@cariboulite_radio.c:1276 SMI data synchronization failed
 ```
-
->~~~This is caused by the Pi0 not being able to handle 4 MSPS. During the configuration of SoapyRemote or SDR++ server we shall change this to 2 MSPS.~~~ 
-
 >I have just discovered that this behaviour is in fact due to a defective cariboulite board. It appears to function normally until you try to start the smi stream. Wait on feedback fromCaribouLabs. (May 1st 2025)
 
-> Also the Pi0 can do 4 MSPS if the data type is set CS8 instead of CS16 or CF32.   
+#feature/nbfm_rx
+If you decide to checkout the feature/nbfm_rx the menu after running cariboulite_test_app (I usualy run the app like this: ``` build/cariboulite_test_app 2> debug.log``` from the ```cariboulite``` directory, so that all debug logging goes to ```debug.log```) should look like this:
+```
+	   ____           _ _                 _     _ _         
+	  / ___|__ _ _ __(_) |__   ___  _   _| |   (_) |_ ___   
+	 | |   / _` | '__| | '_ \ / _ \| | | | |   | | __/ _ \  
+	 | |__| (_| | |  | | |_) | (_) | |_| | |___| | ||  __/  
+	  \____\__,_|_|  |_|_.__/ \___/ \__,_|_____|_|\__\___|  
+
+
+ Select a function:
+ [ 0]  Hard reset FPGA
+ [ 1]  Soft reset FPGA
+ [ 2]  Print board info and versions
+ [ 3]  Program FPGA
+ [ 4]  Perform a Self-Test
+ [ 5]  FPGA Digital I/O
+ [ 6]  FPGA RFFE control
+ [ 7]  FPGA SMI fifo status
+ [ 8]  Modem transmit CW signal
+ [ 9]  Modem receive I/Q stream
+ [10]  Synthesizer 85-4200 MHz
+ [11]  NBFM TX Tone
+ [12]  NBFM RX
+ [13]  NBFM modem Self-Test
+ [14]  Monitor Modem Status
+ [99]  Quit
+    Choice:   
+
+```
+>note: for the options 12 and 14 (R) to work correctly you need to have an audio device attached and configured correctly. It uses ALSA and some of these settings are hard-coded. This is WIP. 14 (T) TX tone should work though, transmitting a 650Hz tone, FM modulated on 430.100 MHz.
+
+This is how the monitor modem status output should look like:
+```
+CaribouLite Radio    [T]=TX ON/OFF  [R]=RX ON/OFF  [Q]=QUIT  [X]=RES  1766328674
+    TX Loopback: off    TX Frequency: 430100000 Hz    TX Power: -3 d     0.00361
+Modem Status Registers:
+    RF_CFG:0x08  RF_CLKO:0x1A
+    IQIFC0:0x33  IQIFC1:0x11  IQIFC2:0x0B
+    RF09-RXFDE :0x81  RF24-RXDFE :0x81
+    RF09-TXFDE :0x81  RF24-TXDFE :0x81
+    RF09-PADFE :0x40  RF24-PADFE :0x40
+    RF09-PAC   :0x6B  RF24-PAC   :0x72
+    RF09-IRQM  :0x3F  RF24-IRQM  :0x3F
+    RF09-IQRS  :0x00  RF24-IRQS  :0x00
+    RF09-STATE :0x02  RF24-STATE :0x02
+    RF09-TXDACI:0x7E  RF24-TXDACI:0x00
+    RF09-TXDACQ:0x3F  RF24-TXDACQ:0x00
+FPGA SMI info (0x05):
+    RX FIFO EMPTY: 1
+    TX FIFO FULL : 0
+    SMI CHANNEL  : 1    // 0=RX09 1=RX24
+    SMI DIRECTION: 0    // 0=TX   1=RX
+    DEBUG = 0, MODE: 'Low Power (0)'
+IQ Data Stream:
+    TX_I:0x00000FA1  TX_Q:0x00000013
+    RX_I:0x00000000  RX_Q:0x00000000
+Linux TX FIFO:
+    depth: 64/64 (100%), min:64 max:64
+    puts:64 gets:0 drops:0 tO_put:0 tO_get:0
+    rate: puts 0.0/s, gets 0.0/s  (expect ~100 fps @ 10ms)
+Linux RX FIFO:
+    depth: 0/128 (0%), min:128 max:0
+    puts:0 gets:0 drops:0 tO_put:0 tO_get:0
+    rate: puts 0.0/s, gets 0.0/s  (expect ~100 fps @ 10ms)
+```
+with ```T``` you enable TX (650 Hz tone) with ```R``` you enable RX. 
+
+>Caution! There is no squelch yet so, when no carrier is present, loud noise is emitted from the speaker or headphones! Redude your volume before you try this!   
 
 ###Increase the swapfile size
 During the SDR++ build `make` ran out of memory. Hence I increased the swap file from 512 to 1024.
