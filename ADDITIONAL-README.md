@@ -449,7 +449,8 @@ Install dependencies for SDR++:
 sudo apt install libglfw3 // maybe  not needed.
 sudo apt install libglfw3-dev
 sudo apt install libfftw3-dev
-sudo apt install libvolk2-dev
+sudo apt install libvolk-dev
+sudo apt install libvolk-bin
 sudo apt install libzstd-dev
 sudo apt install librtaudio-dev
 ```
@@ -457,7 +458,7 @@ sudo apt install librtaudio-dev
 or in one go:
 
 ```
-sudo apt install libglfw3-dev libfftw3-dev libvolk2-dev libzstd-dev librtaudio-dev
+sudo apt install libglfw3-dev libfftw3-dev libvolk-dev libvolk-bin libzstd-dev librtaudio-dev
 
 ```
 ### Install via the nightly build package
