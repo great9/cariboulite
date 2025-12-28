@@ -382,6 +382,8 @@ If you decide to checkout the feature/nbfm_rx the menu after running cariboulite
     Choice:   
 
 ```
+>note: when the ```cariboulite_test_app```is started, it loads the fpga with the original firmware. This firmware has no TX path! To use the TX options you need to upload the updated firmware first, that is part of the feature/nbfm_tx_tone and/or feature/nbfm_rx branches. You can do this by executing option 0 (Hard reset FPGA) and option 3 (Program FPGA).
+
 >note: for the options 12 and 14 (R) to work correctly you need to have an audio device attached and configured correctly. It uses ALSA and some of these settings are hard-coded. This is WIP. 14 (T) TX tone should work though, transmitting a 650Hz tone, FM modulated on 430.100 MHz.
 
 This is how the monitor modem status output should look like:
@@ -429,7 +431,7 @@ During the SDR++ build `make` ran out of memory. Hence I increased the swap file
 sudo dphys-swapfile swapoff  
 sudo nano /etc/dphys-swapfile 
 ```
-Chnage the line `CONF_SWAPSIZE=512` to `CONF_SWAPSIZE=1024`. Save the file.
+Change the line `CONF_SWAPSIZE=512` to `CONF_SWAPSIZE=1024`. Save the file.
 
 ```
 sudo dphys-swapfile setup
