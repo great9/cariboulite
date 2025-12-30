@@ -382,7 +382,7 @@ If you decide to checkout the feature/nbfm_rx the menu after running cariboulite
     Choice:   
 
 ```
->note: when the ```cariboulite_test_app```is started, it loads the fpga with the original firmware. This firmware has no TX path! To use the TX options you need to upload the updated firmware first, that is part of the feature/nbfm_tx_tone and/or feature/nbfm_rx branches. You can do this by executing option 0 (Hard reset FPGA) and option 3 (Program FPGA).
+>note: when the ```cariboulite_test_app```is started, it loads the fpga with the original firmware. This firmware has no TX path! To use the TX options you need to upload the updated firmware first, that is part of the feature/nbfm_tx_tone and/or feature/nbfm_rx branches. You can do this by executing option ```[ 0] Hard reset FPGA``` and option ```[ 3] Program FPGA```.
 
 >note: for the options 12 and 14 (R) to work correctly you need to have an audio device attached and configured correctly. It uses ALSA and some of these settings are hard-coded. This is WIP. 14 (T) TX tone should work though, transmitting a 650Hz tone, FM modulated on 430.100 MHz.
 
@@ -424,6 +424,32 @@ with ```T``` you enable TX (650 Hz tone) with ```R``` you enable RX.
 
 >Caution! There is no squelch yet so, when no carrier is present, loud noise is emitted from the speaker or headphones! Redude your volume before you try this!   
 
+#Modifying the firmware (FPGA)
+
+You need some addtional tools such as icestorm, nextpnr and yosys to convert verilog (verilog-2005) in to a file that can be programmed to the Lattice ICE40 FPGA. 
+
+Please install the pre-requisites, icestorm, nextpnr and yosys.
+You can follow the instructions here:https://prjicestorm.readthedocs.io/en/latest/overview.html#where-are-the-tools-how-to-install
+
+```
+@MISC{IceStorm,
+    author = {Claire Wolf and Mathias Lasser},
+    title = {Project IceStorm},
+    howpublished = "\url{https://prjicestorm.readthedocs.io/}"
+}
+```
+
+Once the tools have been installed, you can modify the firmware and load the program to the FPGA. I typically use these two commands:
+
+```
+make clean
+make build
+```
+and then I use the ```cariboulite_test_app``` to program the FPGA with new firmware through optinions  ```[ 0] Hard reset FPGA``` and ```[ 3] Program FPGA```.
+
+
+#SDR++
+
 ###Increase the swapfile size
 During the SDR++ build `make` ran out of memory. Hence I increased the swap file from 512 to 1024.
 
@@ -443,7 +469,6 @@ Or:
 ```
 sudo reboot
 ```
-#SDR++
 
 Install dependencies for SDR++:
 
