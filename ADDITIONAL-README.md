@@ -450,8 +450,8 @@ and then I use the ```cariboulite_test_app``` to program the FPGA with new firmw
 
 #SDR++
 
-###Increase the swapfile size
-During the SDR++ build `make` ran out of memory. Hence I increased the swap file from 512 to 1024.
+###Increase the swapfile size (Pi Zero only?)
+During the SDR++ build `make` ran out of memory (on the Pi Zero?). Hence I increased the swap file from 512 to 1024.
 
 ```
 sudo dphys-swapfile swapoff  
