@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.15...3.27)
 project(cariboulite 
         VERSION 1.2.0
         LANGUAGES C CXX
