@@ -1257,6 +1257,20 @@ static void rf10_fifo_get_stats(rf10_fifo_t* f, rf10_stats_t* s)
     pthread_mutex_unlock(&f->m);
 }
 
+static void rf10_fifo_flush(rf10_fifo_t* f)
+{
+    if (!f) return;
+    pthread_mutex_lock(&f->m);
+    f->r = f->w = 0;
+    f->count = 0;
+    // keep stats or reset them—your choice:
+    f->min_depth = 0;
+    f->max_depth = 0;
+    pthread_cond_broadcast(&f->can_put);
+    pthread_cond_broadcast(&f->can_get);
+    pthread_mutex_unlock(&f->m);
+}
+
 static void rf10_fifo_destroy(rf10_fifo_t* f)
 {
     if (!f) return;
@@ -1373,6 +1387,23 @@ static void* dsp_producer_thread_func(void* arg)
     size_t frame_idx = 0;
 
     while (ctrl->active) {
+
+        // ============================================================
+        // TX OFF: do not generate or enqueue frames
+        // ============================================================
+        if (!nbfm_tx_active) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 2 * 1000 * 1000 }; // 2 ms
+            nanosleep(&ts, NULL);
+
+            // Re-anchor timing so we don't accumulate drift
+            next_ns = mono_ns();
+            last_wake = 0;
+            continue;
+        }
+
+        // ============================================================
+        // Normal TX ON path (10 ms cadence)
+        // ============================================================
         // ---- schedule next absolute wake ----
         next_ns += PERIOD_NS;
         struct timespec next_ts = {
@@ -1677,6 +1708,35 @@ int tx_pipeline_init(tx_pipeline_t* p, sys_st* sys,
     return 0;
 }
 
+// ---------- TX: tone injection helper (blocking) ----------
+static void tx_inject_tone_ms(tx_pipeline_t* p, float hz, int ms)
+{
+    if (!p || !p->inited) return;
+
+    // Save current generator settings
+    const bool  prev_tone_mode     = p->tx_ctrl.tone_mode;
+    const float prev_tone_hz       = p->tx_ctrl.tone_hz;
+    const bool  prev_live_from_mic = p->tx_ctrl.live_from_mic;
+
+    // Force tone (DSP producer checks tone_mode first)
+    p->tx_ctrl.live_from_mic = false;
+    p->tx_ctrl.tone_mode     = true;
+    p->tx_ctrl.tone_hz       = hz;
+    __sync_synchronize();
+
+    // Hold for requested time
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+
+    // Restore
+    p->tx_ctrl.live_from_mic = prev_live_from_mic;
+    p->tx_ctrl.tone_mode     = prev_tone_mode;
+    p->tx_ctrl.tone_hz       = prev_tone_hz;
+    __sync_synchronize();
+}
+
 int tx_pipeline_start(tx_pipeline_t* p)
 {
     if (!p || !p->inited || p->running) return -1;
@@ -1689,6 +1749,9 @@ int tx_pipeline_start(tx_pipeline_t* p)
         HW_UNLOCK();
         usleep(2000);
     }
+
+    // Clear any stale queued frames before starting TX
+    rf10_fifo_flush(&p->txq);
 
     HW_LOCK();
     caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_tx_lowpass);
@@ -1703,12 +1766,41 @@ int tx_pipeline_start(tx_pipeline_t* p)
     nbfm_tx_active = true;
 
     p->running = true;
+    
+    // --- Quindar "start" tone: 2525 Hz for 250 ms ---
+    tx_inject_tone_ms(p, 2525.0f, 250);
+    
     return 0;
+}
+
+static void tx_wait_fifo_drain(tx_pipeline_t* p, int timeout_ms)
+{
+    if (!p) return;
+    const uint64_t t0 = mono_ns();
+    while (1) {
+        rf10_stats_t s;
+        rf10_fifo_get_stats(&p->txq, &s);
+        if (s.count == 0) return;
+
+        const uint64_t now = mono_ns();
+        const double ms = (now - t0) / 1e6;
+        if (ms >= (double)timeout_ms) return;
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 2*1000*1000 };
+        nanosleep(&ts, NULL);
+    }
 }
 
 void tx_pipeline_stop(tx_pipeline_t* p)
 {
     if (!p || !p->inited || !p->running) return;
+    
+    // --- Quindar "stop" tone: 2475 Hz for the last 250 ms ---
+    // Keep TX running while we send the tail tone
+    tx_inject_tone_ms(p, 2475.0f, 250);
+
+    // Wait for those frames to actually be consumed by the writer
+    tx_wait_fifo_drain(p, 500);   // 0.5s is plenty for 250ms of frames
 
     nbfm_tx_active = false;
     __sync_synchronize();
@@ -2691,17 +2783,17 @@ void monitor_modem_status(sys_st *sys)
     tx_params_t txpar = {
         .freq_hz      = 430100000.0,
         .tx_power_dbm = -3,
-        .tone_mode    = true,
+        .tone_mode    = false,
         .tone_hz      = 600.0f,
         .tone_amp     = 0.4f,
-        .mic_dev      = NULL,
+        .mic_dev      = "plughw:Loopback,0",
         .out_scale    = 4000.0f,
         .f_dev_hz     = 2500.0f,
     };
 
     rx_params_t rxpar = {
         .freq_hz       = 430100000.0,
-        .pcm_dev       = "plughw:3,0",
+        .pcm_dev       = "plughw:Loopback,0", 
         .deemph_tau_s  = 50e-6f,
         .pcm_gain      = 8000.0f,
         .fs_rf         = 4000000.0f,
@@ -2709,8 +2801,8 @@ void monitor_modem_status(sys_st *sys)
     };
 
     // init once (threads idle until start)
-    tx_pipeline_init(&txp, sys, &sys->radio_low, &txpar);
-    rx_pipeline_init(&rxp, sys, &sys->radio_low, &rxpar);
+    tx_pipeline_init(&txp, sys, &sys->radio_high, &txpar);
+    rx_pipeline_init(&rxp, sys, &sys->radio_high, &rxpar);
 
 	nbfm_tx_active = false;
     nbfm_rx_active = false;
@@ -2729,7 +2821,7 @@ void monitor_modem_status(sys_st *sys)
     cariboulite_sample_complex_int16 iq_rx_buffer[iq_rx_buffer_size]; // complex CS16 samples (I, Q interleaved)
 
 
-	cariboulite_radio_state_st *radio = &sys->radio_low; // radio_high (HiF) || radio_low (S1G)
+	cariboulite_radio_state_st *radio = &sys->radio_high; // radio_high (HiF) || radio_low (S1G)
     at86rf215_st *modem = &sys->modem;
 	caribou_fpga_st *fpga = &sys->fpga;
 	caribou_smi_st *smi = &sys->smi;

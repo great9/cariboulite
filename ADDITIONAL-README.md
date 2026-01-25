@@ -726,6 +726,38 @@ cariboulite_self_test@cariboulite_setup.c:513 Self-test process finished with er
 
 I have also tried all the other options such as hard reset of the fpga, soft reset of the fpga, reprogramming of the fpga. During the receive test there are always smi sync errors.
 
+#ALSA
+
+ALSA is complicated. To have some flexibility for testing the nbfm modulator and demodulator it can be helpfull to not have to depend on a physical audio device, such as a sound card.This can be done with a ALSA utility: snd_aloop. What I describe here is based on this article:
+
+based on: https://linuxvox.com/blog/linux-without-hardware-soundcard-capture-audio-playback-and-record-it-to-file/
+
+###Prerequisits:
+
+Ensure 
+```alsa-utils```  ```ffmpeg``` ```sox``` 
+are installed.
+
+note :both alsa-utils and ffmpeg, are already part of the Raspberry OS usualy.
+
+###Making the Loopback Module Persistent
+
+The modprobe command loads the module temporarily (it will unload on reboot). To make it persistent:
+
+Create a configuration file in /etc/modules-load.d/ to load the module at boot:
+
+sudo nano /etc/modules-load.d/alsa-loopback.conf  
+Add the following line and save the file:
+
+snd-aloop  
+Reboot to test persistence (optional, but recommended):
+
+sudo reboot  
+After reboot, re-run lsmod | grep snd_aloop to confirm the module is loaded.
+
+To test if the ALSA Loopback device works you can start the cariboulite_test_app, enable tx and in a separate terminal run the following command: ```speaker-test -D plughw:Loopback,1 -c 1 -t sine```. You should now here a 440 Hz tone on a narrow band fm receiver tuned to the correct frequency.
+
+Similary you can test rx with the following command to 'route' the audio signal from the Loopback device to the plugged in sound card: ```arecord -D plughw:Loopback,1 -f S16_LE -r 48000 -c 1 | aplay -D plughw:4,0```.
 
 
 
