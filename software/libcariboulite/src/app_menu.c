@@ -1069,17 +1069,22 @@ typedef struct {
 } rx_reader_ctrl_st;
 
 typedef struct {
+    volatile int   frames_left;   // number of 10ms frames to override
+    volatile float hz;            // 0 => zeros, else tone frequency
+} tone_injector_t;
+
+typedef struct {
     bool active;
     cariboulite_radio_state_st *radio;
     cariboulite_sample_complex_int16 *tx_buffer;
     size_t tx_buffer_size;
 
 	// (live path)
-    bool    live_from_mic;   // set true to enable live generation
-    alsa48k_source_t* mic;   // ALSA handle
-    nbfm4m_mod_t*     fm;    // 48k->4M NBFM
-    float*            a48k;  // 480-float scratch
-    iq16_t*           iq4m;  // 40k-IQ scratch
+    bool    live_from_mic;     // set true to enable live generation
+    alsa48k_source_t* mic;     // ALSA handle
+    nbfm4m_mod_t*     fm;      // 48k->4M NBFM
+    float*            a48k;    // 480-float scratch
+    iq16_t*           iq4m;    // 40k-IQ scratch
 	
 	// test tone generator for the FM modulator
     bool     tone_mode;        // true => synthesize 600 Hz audio
@@ -1087,8 +1092,10 @@ typedef struct {
     float    tone_hz;          // default 600.0f
     float    tone_amp;         // audio amplitude (0..1), e.g. 0.8f
 	
-	// new
-	rf10_fifo_t* fifo;         // FIFO for 10 ms frames
+    rf10_fifo_t* fifo;         // FIFO for 10 ms frames
+	
+    // new
+	tone_injector_t inj;       // tone injector parameters
 
 } tx_writer_ctrl_st;
 
@@ -1435,13 +1442,45 @@ static void* dsp_producer_thread_func(void* arg)
         // ============================================================
         // 1) Generate 10 ms of audio @ 48 kHz (480 samples)
         // ============================================================
-        if (ctrl->tx->tone_mode) {
-            fill_tone_48k(ctrl->tx, ctrl->tx->a48k, 480);
-        } else if (ctrl->tx->mic) {
-            read_audio_exact(ctrl->tx->mic, ctrl->tx->a48k, 480);
+        
+        // if (ctrl->tx->tone_mode) {
+        //     fill_tone_48k(ctrl->tx, ctrl->tx->a48k, 480);
+        // } else if (ctrl->tx->mic) {
+        //     read_audio_exact(ctrl->tx->mic, ctrl->tx->a48k, 480);
+        // } else {
+        //     memset(ctrl->tx->a48k, 0, 480 * sizeof(float));
+        // }
+        
+        // 1) Generate 10 ms of audio @ 48 kHz (480 samples)
+        // Injector overrides: hz==0 => silence, else tone(hz)
+        int inj_left = ctrl->tx->inj.frames_left;
+        float inj_hz = ctrl->tx->inj.hz;
+
+        if (inj_left > 0) {
+            // consume exactly one 10ms frame
+            ctrl->tx->inj.frames_left = inj_left - 1;
+
+            if (inj_hz == 0.0f) {
+                memset(ctrl->tx->a48k, 0, 480 * sizeof(float));
+            } else {
+                float saved = ctrl->tx->tone_hz;
+                ctrl->tx->tone_hz = inj_hz;
+                fill_tone_48k(ctrl->tx, ctrl->tx->a48k, 480);
+                ctrl->tx->tone_hz = saved;
+            }
+
+            __sync_synchronize();
         } else {
-            memset(ctrl->tx->a48k, 0, 480 * sizeof(float));
+            // normal path
+            if (ctrl->tx->tone_mode) {
+                fill_tone_48k(ctrl->tx, ctrl->tx->a48k, 480);
+            } else if (ctrl->tx->mic) {
+                read_audio_exact(ctrl->tx->mic, ctrl->tx->a48k, 480);
+            } else {
+                memset(ctrl->tx->a48k, 0, 480 * sizeof(float));
+            }
         }
+
 
         // ============================================================
         // 2) Push into NBFM modulator, pull 10 ms @ 4 MS/s (40 k IQ)
@@ -1676,14 +1715,22 @@ int tx_pipeline_init(tx_pipeline_t* p, sys_st* sys,
         rf10_fifo_destroy(&p->txq);
         return -2;
     }
+    
+    p->tx_ctrl.inj.frames_left = 0;
+    p->tx_ctrl.inj.hz = 0.0f;
 
     // Optional mic
     if (p->tx_ctrl.live_from_mic) {
         p->tx_ctrl.mic = alsa48k_create(par->mic_dev, 1.0f);
         if (!p->tx_ctrl.mic) {
-            // mic failed — fall back to tone
-            p->tx_ctrl.live_from_mic = false;
-            p->tx_ctrl.tone_mode     = true;
+            fprintf(stderr, "[tx_pipeline] ALSA capture open failed (%s)\n",
+                    par->mic_dev ? par->mic_dev : "(null)");
+            // clean up & return error so caller sees it
+            nbfm4m_destroy(p->tx_ctrl.fm);
+            free(p->tx_ctrl.a48k);
+            free(p->tx_ctrl.iq4m);
+            rf10_fifo_destroy(&p->txq);
+            return -5;
         }
     }
 
@@ -1708,33 +1755,34 @@ int tx_pipeline_init(tx_pipeline_t* p, sys_st* sys,
     return 0;
 }
 
-// ---------- TX: tone injection helper (blocking) ----------
-static void tx_inject_tone_ms(tx_pipeline_t* p, float hz, int ms)
+static inline int ms_to_frames_10ms(int ms) { return (ms + 9) / 10; }
+
+static void tx_inject_frames(tx_pipeline_t* p, float hz, int frames)
 {
-    if (!p || !p->inited) return;
+    if (!p || frames <= 0) return;
 
-    // Save current generator settings
-    const bool  prev_tone_mode     = p->tx_ctrl.tone_mode;
-    const float prev_tone_hz       = p->tx_ctrl.tone_hz;
-    const bool  prev_live_from_mic = p->tx_ctrl.live_from_mic;
-
-    // Force tone (DSP producer checks tone_mode first)
-    p->tx_ctrl.live_from_mic = false;
-    p->tx_ctrl.tone_mode     = true;
-    p->tx_ctrl.tone_hz       = hz;
+    p->tx_ctrl.inj.hz = hz;
+    p->tx_ctrl.inj.frames_left = frames;
     __sync_synchronize();
 
-    // Hold for requested time
-    struct timespec ts;
-    ts.tv_sec  = ms / 1000;
-    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
+    // wait until consumed
+    while (p->tx_ctrl.inj.frames_left > 0) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 2*1000*1000 };
+        nanosleep(&ts, NULL);
+    }
+}
 
-    // Restore
-    p->tx_ctrl.live_from_mic = prev_live_from_mic;
-    p->tx_ctrl.tone_mode     = prev_tone_mode;
-    p->tx_ctrl.tone_hz       = prev_tone_hz;
-    __sync_synchronize();
+static void tx_inject_tone_with_zeros(tx_pipeline_t* p,
+                                      float hz, int tone_ms,
+                                      int pre_zero_frames,
+                                      int post_zero_frames)
+{
+    if (pre_zero_frames  < 1) pre_zero_frames  = 1;
+    if (post_zero_frames < 1) post_zero_frames = 1;
+
+    tx_inject_frames(p, 0.0f, pre_zero_frames);                 // silence
+    tx_inject_frames(p, hz,   ms_to_frames_10ms(tone_ms));       // tone
+    tx_inject_frames(p, 0.0f, post_zero_frames);                // silence
 }
 
 int tx_pipeline_start(tx_pipeline_t* p)
@@ -1767,8 +1815,8 @@ int tx_pipeline_start(tx_pipeline_t* p)
 
     p->running = true;
     
-    // --- Quindar "start" tone: 2525 Hz for 250 ms ---
-    tx_inject_tone_ms(p, 2525.0f, 250);
+    // --- Quindar "start" tone: 2525 Hz for 250 ms with 5 frmaes of padding ---
+    tx_inject_tone_with_zeros(p, 2525.0f, 250, 5, 5);
     
     return 0;
 }
@@ -1795,12 +1843,12 @@ void tx_pipeline_stop(tx_pipeline_t* p)
 {
     if (!p || !p->inited || !p->running) return;
     
-    // --- Quindar "stop" tone: 2475 Hz for the last 250 ms ---
+    // --- Quindar "stop" tone: 2475 Hz for the last 250 ms with 5 frames of padding ---
     // Keep TX running while we send the tail tone
-    tx_inject_tone_ms(p, 2475.0f, 250);
+    tx_inject_tone_with_zeros(p, 2475.0f, 250, 5, 5);
 
     // Wait for those frames to actually be consumed by the writer
-    tx_wait_fifo_drain(p, 500);   // 0.5s is plenty for 250ms of frames
+    tx_wait_fifo_drain(p, 350);   // 0.5s is plenty for 250ms of frames
 
     nbfm_tx_active = false;
     __sync_synchronize();
