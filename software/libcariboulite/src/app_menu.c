@@ -2834,14 +2834,14 @@ void monitor_modem_status(sys_st *sys)
         .tone_mode    = false,
         .tone_hz      = 600.0f,
         .tone_amp     = 0.4f,
-        .mic_dev      = "plughw:Loopback,0",
+        .mic_dev      = "plughw:Loopback,1,1", // app reads
         .out_scale    = 4000.0f,
         .f_dev_hz     = 2500.0f,
     };
 
     rx_params_t rxpar = {
         .freq_hz       = 430100000.0,
-        .pcm_dev       = "plughw:Loopback,0", 
+        .pcm_dev       = "plughw:Loopback,0,0", // app writes
         .deemph_tau_s  = 50e-6f,
         .pcm_gain      = 8000.0f,
         .fs_rf         = 4000000.0f,
