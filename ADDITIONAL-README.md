@@ -749,7 +749,7 @@ Create a configuration file in /etc/modules-load.d/ to load the module at boot:
 sudo nano /etc/modules-load.d/alsa-loopback.conf  
 Add the following line and save the file:
 
-snd-aloop  
+```snd-aloop```  
 Reboot to test persistence (optional, but recommended):
 
 sudo reboot  
