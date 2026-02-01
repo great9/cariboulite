@@ -2860,9 +2860,11 @@ void monitor_modem_status(sys_st *sys)
 	noecho();
 	timeout(200);
         
-	double frequency = 430100000; // Default frequency in Hz
-	int tx_power     = -3;	      // Default power in dBm
-
+	double frequency = 430100000;     // Default frequency in Hz
+	int    tx_power  = -3;	          // Default power in dBm
+    float  tx_bw     = 1000000.0f;    // Default TX bandwidth in Hz
+    float  tx_sr     = 4000000.0f;    // Default TX sample rate in Hz
+    
 	int iq_tx_buffer_size = (1u << 18);
 	int iq_rx_buffer_size = (1u << 18);
 	cariboulite_sample_complex_int16 iq_tx_buffer[iq_tx_buffer_size]; // complex CS16 samples (I, Q interleaved)
@@ -2895,8 +2897,6 @@ void monitor_modem_status(sys_st *sys)
     .tx_buffer_size = iq_tx_buffer_size,
     };
     
-
-
 	//int screen_max_y; 
 	int screen_max_x;
 	// int ret = 0;
@@ -2905,10 +2905,10 @@ void monitor_modem_status(sys_st *sys)
 	HW_LOCK(); 
 	cariboulite_radio_set_frequency(radio, true, &frequency);
 	cariboulite_radio_set_tx_power(radio, tx_power);
+    cariboulite_radio_set_tx_bandwidth_flt(radio,tx_bw);
+    cariboulite_radio_set_tx_samp_cutoff_flt(radio, tx_sr);    
 	HW_UNLOCK();
-	radio->tx_loopback_anabled = false;  // disbale | enable TX loopback for testing
-	radio->tx_control_with_iq_if = true; // disable | enable TX control with IQ interface
-
+	
 	time_t current_time;
 	clock_t loop_start, loop_end;
 	float elapsed_time = 0.0;
@@ -2930,9 +2930,6 @@ void monitor_modem_status(sys_st *sys)
 		move(0, screen_max_x - 12);
 		printw("%12ld",current_time);
 		move(1,0);
-		printw("    TX Loopback: %s",radio->tx_loopback_anabled?"on":"off");
-		//printw("    TX Frequency: %.0f Hz", round(frequency/1000)*1000);
-		//printw("    TX Power: %d dBm", tx_power);
         printw("    TX Frequency: %.0f Hz", round(txpar.freq_hz/1000)*1000);
         printw("    TX Power: %d dBm", txpar.tx_power_dbm);
         move(1, screen_max_x - 12);
@@ -2968,6 +2965,16 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF24_TXDFE, data, 1);
         HW_UNLOCK();
         uint8_t rf24_txdfe = data[0];
+
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_TXCUTC, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_txcutc = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_TXCUTC, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_txcutc = data[0];
+        
         HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_RXDFE, data, 1);
         HW_UNLOCK();
@@ -2978,6 +2985,8 @@ void monitor_modem_status(sys_st *sys)
         uint8_t rf24_rxdfe = data[0];
         printw("    RF09-RXFDE :0x%02X  RF24-RXDFE :0x%02X\n", rf09_rxdfe, rf24_rxdfe);
         printw("    RF09-TXFDE :0x%02X  RF24-TXDFE :0x%02X\n", rf09_txdfe, rf24_txdfe);
+        printw("    RF09-TXCUTC:0x%02X  RF24-TXCUTC:0x%02X\n", rf09_txcutc, rf24_txcutc);
+        
         //refresh();
         HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_STATE, data, 1);
@@ -3057,11 +3066,15 @@ void monitor_modem_status(sys_st *sys)
         //refresh();
         //smi_state = caribou_smi_get_driver_streaming_state(smi);
         //printw("SMI driver state: 0x%02X    // 0=idle 1=RX09 2=RX24 3=TX\n",(uint8_t) smi->state);
-        uint8_t tx_sample_gap = 1;
+        uint8_t tx_sample_gap = 255;
         HW_LOCK();
         caribou_fpga_get_sys_ctrl_tx_sample_gap(fpga, &tx_sample_gap);
+        cariboulite_radio_get_tx_bandwidth_flt(radio, &tx_bw);
+        cariboulite_radio_get_tx_samp_cutoff_flt(radio, &tx_sr);
         HW_UNLOCK();
-        //printw("TX sample gap: %d\n", tx_sample_gap);
+        printw("    TX sample gap : %d\n", tx_sample_gap);
+        printw("    TX bandwidth  : %.0f Hz\n", tx_bw);
+        printw("    TX sample rate: %.0f Hz\n", tx_sr);
         //refresh();
 
         // --- TX FIFO stats panel ---
