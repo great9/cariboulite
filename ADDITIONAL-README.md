@@ -759,6 +759,14 @@ To test if the ALSA Loopback device works you can start the cariboulite_test_app
 
 Similary you can test rx with the following command to 'route' the audio signal from the Loopback device to the plugged in sound card: ``` arecord -D plughw:Loopback,1,0 -f S16_LE -c 1 -r 48000 | aplay  -D plughw:4,0 -f S16_LE -c 1 -r 48000```.
 
+If faced with ```overruns!!!``` one could also use:
+
+```alsaloop -C plughw:Loopback,1,0 -P plughw:4,0 -r 48000 -c 1 -f S16_LE -t 50000``` 
+
+or 
+
+```arecord -D plughw:Loopback,1,0 -f S16_LE -c 1 -r 48000 --buffer-time=100000 --period-time=25000 | aplay  -D plughw:4,0 -f S16_LE -c 1 -r 48000 --buffer-time=100000 --period-time=25000```
+
 
 
 #GNU-RADIO (WIP)
