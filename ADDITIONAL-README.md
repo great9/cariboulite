@@ -755,7 +755,15 @@ Reboot to test persistence (optional, but recommended):
 sudo reboot  
 After reboot, re-run lsmod | grep snd_aloop to confirm the module is loaded.
 
+### Testing TX
+
 To test if the ALSA Loopback device works you can start the cariboulite_test_app, enable tx and in a separate terminal run the following command: ```speaker-test -D plughw:Loopback,0,1 -c 1 -t sine -f 440 -r 48000```. You should now here a 440 Hz tone on a narrow band fm receiver tuned to the correct frequency.
+
+If you want to route the microphone audio of your USB audio device to the caribloulite instead of a test tone, you can use this command: ```arecord -D plughw:4,0 -f S16_LE -c 1 -r 48000 | aplay  -D plughw:Loopback,0,1 -f S16_LE -c 1 -r 48000```.
+
+For some obscure reason the alsaloop command doesn't work for this route.
+
+### Testing RX
 
 Similary you can test rx with the following command to 'route' the audio signal from the Loopback device to the plugged in sound card: ``` arecord -D plughw:Loopback,1,0 -f S16_LE -c 1 -r 48000 | aplay  -D plughw:4,0 -f S16_LE -c 1 -r 48000```.
 
@@ -769,7 +777,7 @@ or
 
 
 
-#GNU-RADIO (WIP)
+# GNU-RADIO (WIP)
 ```
 sudp apt install gnuradio
 ```
