@@ -212,6 +212,7 @@ typedef enum
 #define REG_RF09_PAC                        0x0114
 #define REG_RF09_TXDFE                      0x0113
 #define REG_RF09_TXCUTC                     0x0112
+#define REG_RF09_RSSI                       0x010D
 
 /* RF24 Radio */
 #define REG_RF24_AUXS                      	0x0201
@@ -220,6 +221,7 @@ typedef enum
 #define REG_RF24_PAC                        0x0214
 #define REG_RF24_TXDFE                      0x0213
 #define REG_RF24_TXCUTC                     0x0212
+#define REG_RF24_RSSI                       0x020D
 
 /* power levels */
 #define RF_TXPWR_00							0x00		//-21.4dBm

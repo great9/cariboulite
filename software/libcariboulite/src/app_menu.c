@@ -2974,6 +2974,15 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF24_TXCUTC, data, 1);
         HW_UNLOCK();
         uint8_t rf24_txcutc = data[0];
+
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_RSSI, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_rssi = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_RSSI, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_rssi = data[0];
         
         HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_RXDFE, data, 1);
@@ -2983,6 +2992,8 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF24_RXDFE, data, 1);
         HW_UNLOCK();
         uint8_t rf24_rxdfe = data[0];
+        printw("    RF09-RSSI  :0x%02X  RF24-RSSI  :0x%02X\n", rf09_rssi, rf24_rssi);
+        printw("    RF09-RSSI  :%+4d  RF24-RSSI  :%+4d dBm\n", (int8_t)rf09_rssi, (int8_t)rf24_rssi);
         printw("    RF09-RXFDE :0x%02X  RF24-RXDFE :0x%02X\n", rf09_rxdfe, rf24_rxdfe);
         printw("    RF09-TXFDE :0x%02X  RF24-TXDFE :0x%02X\n", rf09_txdfe, rf24_txdfe);
         printw("    RF09-TXCUTC:0x%02X  RF24-TXCUTC:0x%02X\n", rf09_txcutc, rf24_txcutc);
