@@ -90,10 +90,6 @@ typedef enum
     at86rf215_clock_out_freq_1mhz = 7,
 } at86rf215_clock_out_freq_en;
 
-/* bandwidth */
-#define REG_RF09_RXBWC                      0x0109
-#define REG_RF24_RXBWC                      0x0209
-
 /* Front end FE Pads */
 #define REG_RF09_PADFE			            0x0116
 #define REG_RF24_PADFE			            0x0216
@@ -138,10 +134,6 @@ typedef enum
 #define RX_IFS_Deactive				        0x00
 #define RX_IFS_Active				        0x01
 
-/* sampling rate */
-#define REG_RF09_RXDFE                      0x010A
-#define REG_RF24_RXDFE                      0x020A
-
 /* different sampling rate values */
 #define RF_SR4000                           0x01
 #define RF_SR2000                           0x02
@@ -158,12 +150,6 @@ typedef enum
 #define RF_CUT_1_2                          0x02
 #define RF_CUT_3_4                          0x03
 #define RF_CUT_4_4                          0x04
-
-/* AGC */
-#define REG_RF09_AGCC                       0x010B
-#define REG_RF09_AGCS                       0x010C
-#define REG_RF24_AGCC                       0x020B
-#define REG_RF24_AGCS                       0x020C
 
 /* AGC values */
 
@@ -209,19 +195,33 @@ typedef enum
 #define REG_RF09_AUXS                      	0x0101
 #define REG_RF09_STATE                      0x0102
 #define REG_RF09_CMD                        0x0103
+/* TX */
 #define REG_RF09_PAC                        0x0114
 #define REG_RF09_TXDFE                      0x0113
 #define REG_RF09_TXCUTC                     0x0112
+/* RX */
 #define REG_RF09_RSSI                       0x010D
+#define REG_RF09_RXDFE                      0x010A
+#define REG_RF09_RXBWC                      0x0109
+#define REG_RF09_AGCC                       0x010B
+#define REG_RF09_AGCS                       0x010C
+
 
 /* RF24 Radio */
 #define REG_RF24_AUXS                      	0x0201
 #define REG_RF24_CMD                        0x0203
 #define REG_RF24_STATE                      0x0202
+/* TX */
 #define REG_RF24_PAC                        0x0214
 #define REG_RF24_TXDFE                      0x0213
 #define REG_RF24_TXCUTC                     0x0212
+/* RX */
 #define REG_RF24_RSSI                       0x020D
+#define REG_RF24_RXDFE                      0x020A
+#define REG_RF24_RXBWC                      0x0209
+#define REG_RF24_AGCC                       0x020B
+#define REG_RF24_AGCS                       0x020C
+
 
 /* power levels */
 #define RF_TXPWR_00							0x00		//-21.4dBm
