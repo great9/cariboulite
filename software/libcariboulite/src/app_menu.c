@@ -2864,7 +2864,9 @@ void monitor_modem_status(sys_st *sys)
 	int    tx_power  = -3;	          // Default power in dBm
     float  tx_bw     = 1000000.0f;    // Default TX bandwidth in Hz
     float  tx_sr     = 4000000.0f;    // Default TX sample rate in Hz
-    
+    float  rx_bw     = 2000000.0f;    // Default RX bandwidth in Hz
+    float  rx_sr     = 4000000.0f;    // Default RX sample rate in Hz
+
 	int iq_tx_buffer_size = (1u << 18);
 	int iq_rx_buffer_size = (1u << 18);
 	cariboulite_sample_complex_int16 iq_tx_buffer[iq_tx_buffer_size]; // complex CS16 samples (I, Q interleaved)
@@ -2906,7 +2908,10 @@ void monitor_modem_status(sys_st *sys)
 	cariboulite_radio_set_frequency(radio, true, &frequency);
 	cariboulite_radio_set_tx_power(radio, tx_power);
     cariboulite_radio_set_tx_bandwidth_flt(radio,tx_bw);
-    cariboulite_radio_set_tx_samp_cutoff_flt(radio, tx_sr);    
+    cariboulite_radio_set_tx_samp_cutoff_flt(radio, tx_sr);
+    cariboulite_radio_set_rx_bandwidth_flt(radio,rx_bw);
+    cariboulite_radio_set_rx_sample_rate_flt(radio, rx_sr);
+
 	HW_UNLOCK();
 	
 	time_t current_time;
@@ -2954,8 +2959,12 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF_CLKO, data, 1);
         HW_UNLOCK();
         uint8_t rf_clko = data[0];
-        printw("    RF_CFG:0x%02X  RF_CLKO:0x%02X\n", rf_cfg, rf_clko);
-        printw("    IQIFC0:0x%02X  IQIFC1:0x%02X  IQIFC2:0x%02X\n", iqifc0, iqifc1, iqifc2);
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF_RST, data, 1);
+        HW_UNLOCK();
+        uint8_t rf_rst = data[0];
+        printw("    RF_CFG:0x%02X  RF_CLKO:0x%02X  RF_RST:0x%02X\n", rf_cfg, rf_clko, rf_rst);
+        printw("    IQIFC0:0x%02X  IQIFC1 :0x%02X  IQIFC2:0x%02X\n", iqifc0, iqifc1, iqifc2);
         //refresh();
         HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_TXDFE, data, 1);
@@ -3011,7 +3020,7 @@ void monitor_modem_status(sys_st *sys)
         HW_UNLOCK();
         uint8_t rf24_agcc = data[0];
 
-                HW_LOCK();
+        HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_AGCS, data, 1);
         HW_UNLOCK();
         uint8_t rf09_agcs = data[0];
@@ -3019,6 +3028,15 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF24_AGCS, data, 1);
         HW_UNLOCK();
         uint8_t rf24_agcs = data[0];
+
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_PAC, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_pac = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_PAC, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_pac = data[0];
         printw("    RF09-RSSI  :0x%02X  RF24-RSSI  :0x%02X\n", rf09_rssi, rf24_rssi);
         printw("    RF09-RSSI  :%+4d  RF24-RSSI  :%+4d dBm\n", (int8_t)rf09_rssi, (int8_t)rf24_rssi);
         printw("    RF09-RXDFE :0x%02X  RF24-RXDFE :0x%02X\n", rf09_rxdfe, rf24_rxdfe);
@@ -3027,6 +3045,7 @@ void monitor_modem_status(sys_st *sys)
         printw("    RF09-AGCS  :0x%02X  RF24-AGCS  :0x%02X\n", rf09_agcs, rf24_agcs);
         printw("    RF09-TXFDE :0x%02X  RF24-TXDFE :0x%02X\n", rf09_txdfe, rf24_txdfe);
         printw("    RF09-TXCUTC:0x%02X  RF24-TXCUTC:0x%02X\n", rf09_txcutc, rf24_txcutc);
+        printw("    RF09-PAC   :0x%02X  RF24-PAC   :0x%02X\n", rf09_pac,   rf24_pac);
         
         //refresh();
         HW_LOCK();
@@ -3037,6 +3056,16 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF24_STATE, data, 1);
         HW_UNLOCK();
         uint8_t rf24_state = data[0];
+
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_AUXS, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_auxs = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_AUXS, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_auxs = data[0];
+        
         HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_IRQS, data, 1);
         HW_UNLOCK();
@@ -3053,14 +3082,6 @@ void monitor_modem_status(sys_st *sys)
         at86rf215_read_buffer(modem, REG_RF24_IRQM, data, 1);
         HW_UNLOCK();
         uint8_t rf24_irqm = data[0];
-        HW_LOCK();
-        at86rf215_read_buffer(modem, REG_RF09_PAC, data, 1);
-        HW_UNLOCK();
-        uint8_t rf09_pac = data[0];
-        HW_LOCK();
-        at86rf215_read_buffer(modem, REG_RF24_PAC, data, 1);
-        HW_UNLOCK();
-        uint8_t rf24_pac = data[0];
         HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_PADFE, data, 1);
         HW_UNLOCK();
@@ -3079,13 +3100,14 @@ void monitor_modem_status(sys_st *sys)
         HW_UNLOCK();
         uint8_t rf24_txdaci = data[0];
         uint8_t rf24_txdacq = data[1];
-        printw("    RF09-PADFE :0x%02X  RF24-PADFE :0x%02X\n", rf09_padfe, rf24_padfe);
-        printw("    RF09-PAC   :0x%02X  RF24-PAC   :0x%02X\n", rf09_pac,   rf24_pac);
         printw("    RF09-IRQM  :0x%02X  RF24-IRQM  :0x%02X\n", rf09_irqm,  rf24_irqm);
         printw("    RF09-IQRS  :0x%02X  RF24-IRQS  :0x%02X\n", rf09_irqs,  rf24_irqs);	
         printw("    RF09-STATE :0x%02X  RF24-STATE :0x%02X\n", rf09_state, rf24_state);
         printw("    RF09-TXDACI:0x%02X  RF24-TXDACI:0x%02X\n", rf09_txdaci, rf24_txdaci);
         printw("    RF09-TXDACQ:0x%02X  RF24-TXDACQ:0x%02X\n", rf09_txdacq, rf24_txdacq);
+        printw("    RF09-AUXS  :0x%02X  RF24-AUXS  :0x%02X\n", rf09_auxs, rf24_auxs);
+        printw("    RF09-PADFE :0x%02X  RF24-PADFE :0x%02X\n", rf09_padfe, rf24_padfe);
+        
         //refresh();
         HW_LOCK();
         caribou_fpga_get_smi_ctrl_fifo_status(&sys->fpga, &status);
