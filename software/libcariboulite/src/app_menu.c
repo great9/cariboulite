@@ -1816,8 +1816,8 @@ int tx_pipeline_start(tx_pipeline_t* p)
 
     p->running = true;
     
-    // --- Quindar "start" tone: 2525 Hz for 250 ms with 5 frmaes of padding ---
-    tx_inject_tone_with_zeros(p, 2525.0f, 250, 5, 5);
+    // --- Quindar "start" tone: 2525 Hz for 250 ms with 5 frames of padding ---
+    tx_inject_tone_with_zeros(p, 2525.0f, 250, 10, 5);
     
     return 0;
 }
@@ -1846,10 +1846,10 @@ void tx_pipeline_stop(tx_pipeline_t* p)
     
     // --- Quindar "stop" tone: 2475 Hz for the last 250 ms with 5 frames of padding ---
     // Keep TX running while we send the tail tone
-    tx_inject_tone_with_zeros(p, 2475.0f, 250, 5, 5);
+    tx_inject_tone_with_zeros(p, 2475.0f, 250, 5, 25);
 
     // Wait for those frames to actually be consumed by the writer
-    tx_wait_fifo_drain(p, 350);   // 0.5s is plenty for 250ms of frames
+    tx_wait_fifo_drain(p, 600);   // 0.5s is plenty for 250ms of frames
 
     nbfm_tx_active = false;
     __sync_synchronize();
