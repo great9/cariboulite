@@ -67,8 +67,16 @@ extern "C" {
 #define REG_BBC1_FSKDM                      0x0372
 
 /* Common RF */
+#define REG_RF09_PLL                        0x0121
 #define REG_RF09_PLLCF                      0x0122
+#define REG_RF24_PLL                        0x0221
+#define REG_RF24_PLLCF                      0x0222
+
 #define REG_RF_CLKO							0x0007
+
+/* Crystall Oscillator Trim Settings */
+#define REG_RF_XOC				            0x0009
+
 #define RF_CLKO_OFF					        0x00
 typedef enum
 {
@@ -186,11 +194,6 @@ typedef enum
 #define RF_MODE_BBRF09                      0x04
 #define RF_MODE_BBRF24                      0x05
 
-/* Oscillator settings */
-#define REG_RF_XOC				            0x0009
-
-/* Command */
-
 /* RF09 Radio */
 #define REG_RF09_AUXS                      	0x0101
 #define REG_RF09_STATE                      0x0102
@@ -205,7 +208,6 @@ typedef enum
 #define REG_RF09_RXBWC                      0x0109
 #define REG_RF09_AGCC                       0x010B
 #define REG_RF09_AGCS                       0x010C
-
 
 /* RF24 Radio */
 #define REG_RF24_AUXS                      	0x0201
@@ -274,9 +276,9 @@ typedef enum
 
 typedef enum
 {
-    at86rf215_pn_at86rf215 = 0x34,
+    at86rf215_pn_at86rf215   = 0x34,
     at86rf215_pn_at86rf215iq = 0x35,
-    at86rf215_pn_at86rf215m = 0x36,
+    at86rf215_pn_at86rf215m  = 0x36,
 } at86rf215_pn_en;
 
 /* Additional settings */

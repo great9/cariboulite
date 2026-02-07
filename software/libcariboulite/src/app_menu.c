@@ -3245,6 +3245,24 @@ void monitor_modem_status(sys_st *sys)
         uint8_t rf24_txcutc = data[0];
 
         HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_PLL, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_pll = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_PLL, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_pll = data[0];
+
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF09_PLLCF, data, 1);
+        HW_UNLOCK();
+        uint8_t rf09_pllcf = data[0];
+        HW_LOCK();
+        at86rf215_read_buffer(modem, REG_RF24_PLLCF, data, 1);
+        HW_UNLOCK();
+        uint8_t rf24_pllcf = data[0];
+
+        HW_LOCK();
         at86rf215_read_buffer(modem, REG_RF09_RSSI, data, 1);
         HW_UNLOCK();
         uint8_t rf09_rssi = data[0];
@@ -3306,6 +3324,8 @@ void monitor_modem_status(sys_st *sys)
         printw("    RF09-TXFDE :0x%02X  RF24-TXDFE :0x%02X\n", rf09_txdfe, rf24_txdfe);
         printw("    RF09-TXCUTC:0x%02X  RF24-TXCUTC:0x%02X\n", rf09_txcutc, rf24_txcutc);
         printw("    RF09-PAC   :0x%02X  RF24-PAC   :0x%02X\n", rf09_pac,   rf24_pac);
+        printw("    RF09-PLL   :0x%02X  RF24-PLL   :0x%02X\n", rf09_pll,   rf24_pll);
+        printw("    RF09-PLLCF :0x%02X  RF24-PLLCF :0x%02X\n", rf09_pllcf, rf24_pllcf);
         
         //refresh();
         HW_LOCK();
