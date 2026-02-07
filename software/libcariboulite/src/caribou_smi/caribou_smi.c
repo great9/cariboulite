@@ -360,7 +360,7 @@ static int caribou_smi_find_buffer_offset(caribou_smi_st* dev, uint8_t *buffer, 
 
     if (found == false)
     {
-        smi_utils_dump_hex(buffer, 16);
+        //smi_utils_dump_hex(buffer, 16);
         return -1;
     }
 
