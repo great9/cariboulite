@@ -757,10 +757,10 @@ bool cariboulite_radio_wait_mixer_lock(cariboulite_radio_state_st* radio, int re
 	{
 		rffc507x_readback_status(&radio->sys->mixer, NULL, &stat);
 		rffc507x_print_stat(&stat);
-		if (!stat.pll_lock) rffc507x_relock(&radio->sys->mixer);
-	} while (!stat.pll_lock && relock_retries--);
+		if (!stat.fields.pll_lock) rffc507x_relock(&radio->sys->mixer);
+	} while (!stat.fields.pll_lock && relock_retries--);
 
-	return stat.pll_lock;
+	return stat.fields.pll_lock;
 }
 
 //=========================================================================

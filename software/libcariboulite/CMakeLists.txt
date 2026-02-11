@@ -14,6 +14,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Bring the headers
 include_directories(./src)
 include_directories(./src/at86rf215) # AT86RF215 headers
+include_directories(./src/rffc507x)  # RFFC507X  headers
 include_directories(${PROJECT_SOURCE_DIR}/src)
 add_compile_options(-Wall -Wextra -Wno-unused-variable -Wno-missing-braces)
 

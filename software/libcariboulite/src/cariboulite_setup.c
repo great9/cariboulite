@@ -502,7 +502,7 @@ int cariboulite_self_test(sys_st* sys, cariboulite_self_test_result_st* res)
 		ZF_LOGD("Testing mixer communication and versions");
 		rffc507x_device_id_st dev_id;
 		rffc507x_readback_status(&sys->mixer, &dev_id, NULL);
-		if (dev_id.device_id != 0x1140 && dev_id.device_id != 0x11C0)
+		if (dev_id.fields.device_id != 0x1140 && dev_id.fields.device_id != 0x11C0)
 		{
 			ZF_LOGE("The assembled mixer is not RFFC5071/2[A]");
 			res->mixer_fail = 1;

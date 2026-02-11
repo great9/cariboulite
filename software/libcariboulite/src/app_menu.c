@@ -41,6 +41,7 @@ _Static_assert(CARIBOU_SMI_BYTES_PER_SAMPLE == sizeof(caribou_smi_sample_complex
 
 // include here, for testing and access to level registers
 #include <at86rf215.h>
+#include <rffc507x.h>
 
 // include here, for testing
 #define SOURCE "/home/pi/src/cariboulite/firmware/top.bin"
@@ -3137,7 +3138,10 @@ void monitor_modem_status(sys_st *sys)
     at86rf215_st *modem = &sys->modem;
 	caribou_fpga_st *fpga = &sys->fpga;
 	caribou_smi_st *smi = &sys->smi;
-	
+    rffc507x_st *mixer = &sys->mixer;
+    rffc507x_device_id_st mix_id = {0};
+    rffc507x_device_status_st mix_status = {0};
+    
 	caribou_fpga_smi_fifo_status_st status = {0};
     uint8_t *val = (uint8_t *)&status;
 
@@ -3388,6 +3392,16 @@ void monitor_modem_status(sys_st *sys)
         printw("    RF09-AUXS  :0x%02X  RF24-AUXS  :0x%02X\n", rf09_auxs, rf24_auxs);
         printw("    RF09-PADFE :0x%02X  RF24-PADFE :0x%02X\n", rf09_padfe, rf24_padfe);
         
+        //HW_LOCK();
+        rffc507x_readback_status(mixer, &mix_id, &mix_status);
+        //HW_UNLOCK();
+        printw("RFFC507x\n");
+        printw("    ID: 0x%04X REV: 0x%04X\n", mix_id.fields.device_id, mix_id.fields.device_rev);
+        printw("    STAT: 0x%04X PLL_LOCK: %d, CT_CAL: %d, KV_CAL: %d, CT_CAL_FAIL: %d\n",
+			mix_status.raw,
+			mix_status.fields.pll_lock, mix_status.fields.coarse_tune_cal_value, 
+			mix_status.fields.kv_cal_value, mix_status.fields.coarse_tune_cal_fail);
+
         //refresh();
         HW_LOCK();
         caribou_fpga_get_smi_ctrl_fifo_status(&sys->fpga, &status);
