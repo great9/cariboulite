@@ -3110,8 +3110,8 @@ void monitor_modem_status(sys_st *sys)
     };
 
     // init once (threads idle until start)
-    tx_pipeline_init(&txp, sys, &sys->radio_high, &txpar);
-    rx_pipeline_init(&rxp, sys, &sys->radio_high, &rxpar);
+    tx_pipeline_init(&txp, sys, &sys->radio_low, &txpar);
+    rx_pipeline_init(&rxp, sys, &sys->radio_low, &rxpar);
 
 	nbfm_tx_active = false;
     nbfm_rx_active = false;
@@ -3134,7 +3134,7 @@ void monitor_modem_status(sys_st *sys)
     cariboulite_sample_complex_int16 iq_rx_buffer[iq_rx_buffer_size]; // complex CS16 samples (I, Q interleaved)
 
 
-	cariboulite_radio_state_st *radio = &sys->radio_high; // radio_high (HiF) || radio_low (S1G)
+	cariboulite_radio_state_st *radio = &sys->radio_low; // radio_high (HiF) || radio_low (S1G)
     at86rf215_st *modem = &sys->modem;
 	caribou_fpga_st *fpga = &sys->fpga;
 	caribou_smi_st *smi = &sys->smi;
