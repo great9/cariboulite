@@ -166,14 +166,14 @@ static int caribou_smi_get_smi_settings(caribou_smi_st *dev, struct smi_settings
 //=========================================================================
 static int caribou_smi_setup_settings (caribou_smi_st* dev, struct smi_settings *settings, bool print)
 {
-    settings->read_setup_time = 1;
+    settings->read_setup_time = 1;  // orginal value: 0
     settings->read_strobe_time = 3; // orginal value: 5
-    settings->read_hold_time = 1;
+    settings->read_hold_time = 1;   // orginal value: 0
     settings->read_pace_time = 0;
 
-    settings->write_setup_time = 1;
+    settings->write_setup_time = 1;  // orginal value: 0
     settings->write_strobe_time = 3; // orginal value: 5
-    settings->write_hold_time = 1;
+    settings->write_hold_time = 1;   // orginal value: 0
     settings->write_pace_time = 0;
 
 	// 8 bit on each transmission (4 TRX per sample)
