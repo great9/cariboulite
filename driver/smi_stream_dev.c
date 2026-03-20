@@ -166,7 +166,18 @@ static const char *const ioctl_names[] =
 };
 
 
-#define BUSY_WAIT_WHILE_TIMEOUT(C,T,R)          {int t = (T); while ((C) && t>0){t--;} (R)=t>0;}
+/*
+ * Wall-clock busy-wait.  The old macro counted CPU loop iterations, which
+ * is non-deterministic under frequency scaling (common on kernel 6.12+).
+ * This version uses ktime so the timeout is in real microseconds.
+ */
+#define BUSY_WAIT_WHILE_TIMEOUT(C, timeout_us, R) \
+    do { \
+        ktime_t __deadline = ktime_add_us(ktime_get(), (timeout_us)); \
+        while ((C) && ktime_before(ktime_get(), __deadline)) \
+            cpu_relax(); \
+        (R) = !(C); \
+    } while (0)
 
 /***************************************************************************/
 static void write_smi_reg(struct bcm2835_smi_instance *inst, 
@@ -437,8 +448,8 @@ static int smi_disable_sync(struct bcm2835_smi_instance *smi_inst)
     smics_temp = read_smi_reg(smi_inst, SMICS) & ~(SMICS_ENABLE | SMICS_WRITE);
     write_smi_reg(smi_inst, smics_temp, SMICS);
     
-    // wait for the ENABLE to go low
-    BUSY_WAIT_WHILE_TIMEOUT(smi_enabled(smi_inst), 100000U, success);
+    // wait for the ENABLE to go low (1 ms wall-clock timeout)
+    BUSY_WAIT_WHILE_TIMEOUT(smi_enabled(smi_inst), 1000, success);
     
     if (!success)
     {
@@ -609,8 +620,8 @@ static int smi_init_programmed_transfer(struct bcm2835_smi_instance *smi_inst, e
     */
     mb();
     
-    // busy wait as long as the transaction is active (taking place)
-    BUSY_WAIT_WHILE_TIMEOUT(smi_is_active(smi_inst), 1000000U, success);
+    // busy wait as long as the transaction is active (10 ms wall-clock timeout)
+    BUSY_WAIT_WHILE_TIMEOUT(smi_is_active(smi_inst), 10000, success);
     if (!success)
     {
         dev_info(inst->dev, "smi_init_programmed_transfer error disable. %u %08X", smi_enabled(smi_inst), read_smi_reg(smi_inst, SMICS));
