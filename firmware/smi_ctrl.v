@@ -87,8 +87,19 @@ module smi_ctrl
     end
 
     // ---------------------------------------
-    // RX SIDE (FPGA -> Pi)  -- original semantics kept
+    // RX SIDE (FPGA -> Pi)
     // ---------------------------------------
+    // CDC fix: the FIFO output (i_rx_fifo_pulled_data) lives in the
+    // sys_clk domain.  The SOE-clocked serialiser used to sample it
+    // directly — a raw clock-domain crossing that can cause metastable
+    // or corrupt bytes on the SMI bus.
+    //
+    // Fix: a holding register (r_rx_holding) in sys_clk captures the
+    // FIFO output one cycle after the pull.  By the time the SOE
+    // domain latches it (2+ SOE cycles later), the register has been
+    // stable for many sys_clk periods — no metastability risk.
+    // ---------------------------------------
+
     reg [4:0]  int_cnt_rx;              // 0,8,16,24 wrap
     reg        r_fifo_pull, r_fifo_pull_1;
     reg        w_fifo_pull_trigger;     // pulse on 2nd byte
@@ -101,6 +112,24 @@ module smi_ctrl
 
     // Make a single-cycle rd_en in sys domain using the 2-FF edge detect
     assign o_rx_fifo_pull = !r_fifo_pull_1 && r_fifo_pull && !i_rx_fifo_empty;
+
+    // --- sys_clk domain: holding register for FIFO output ---
+    // Captures i_rx_fifo_pulled_data one sys_clk cycle after the pull,
+    // then stays stable until the next pull — safe for the SOE domain
+    // to read without a synchroniser.
+    reg [31:0] r_rx_holding;
+    reg        r_pull_done;             // 1-cycle delayed copy of pull
+
+    always @(posedge i_sys_clk or negedge i_rst_b) begin
+        if (!i_rst_b) begin
+            r_rx_holding <= 32'h0000_0000;
+            r_pull_done  <= 1'b0;
+        end else begin
+            r_pull_done <= o_rx_fifo_pull;
+            if (r_pull_done)
+                r_rx_holding <= i_rx_fifo_pulled_data;
+        end
+    end
 
     // Byte emit on SOE falling edge; request next word while sending byte#1
     always @(negedge soe_and_reset or negedge i_rst_b) begin
@@ -116,9 +145,9 @@ module smi_ctrl
             // drive current byte LSB->MSB order
             o_smi_data_out <= r_fifo_pulled_data[int_cnt_rx +: 8];
 
-            // latch next 32b word right after sending the 4th byte (24)
+            // latch next 32b word from the *holding register* (safe CDC)
             if (int_cnt_rx == 5'd24)
-                r_fifo_pulled_data <= i_rx_fifo_pulled_data;
+                r_fifo_pulled_data <= r_rx_holding;
 
             // advance byte index: 0,8,16,24, wrap by 5b overflow
             int_cnt_rx <= int_cnt_rx + 5'd8;
@@ -255,7 +284,5 @@ always @(posedge i_sys_clk or negedge i_rst_b) begin
         end
     end
 end
-// SMI write request mirrors FIFO backpressure
-assign o_smi_write_req = !i_tx_fifo_full;
 
 endmodule
