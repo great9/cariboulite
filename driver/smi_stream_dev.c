@@ -534,24 +534,25 @@ static int smi_disable_sync(struct bcm2835_smi_instance *smi_inst)
 // }
 
 /* Refresh SMIL with a new transfer window and pulse START.
- * SMIL is only latched by the hardware when ACTIVE==0; writing it
- * while ACTIVE==1 is silently ignored, wasting the refresh and
- * leaving SMIL to drain to zero (causing a stall).  Guard the
- * write so it only happens when the peripheral is idle.
+ *
+ * SMIL is only latched by hardware when ACTIVE==0.  Writing it while
+ * ACTIVE==1 is silently ignored — but harmless.  We unconditionally
+ * write on every DMA callback so the few times ACTIVE briefly drops
+ * to 0 between transfer periods, the write takes effect and prevents
+ * SMIL from draining to zero (which would stall DREQ generation).
+ *
+ * Do NOT guard this with an smi_is_active() check — during continuous
+ * RX streaming, ACTIVE is almost always 1, and skipping the write
+ * starves SMIL, causing the data path to stall.
  */
 static inline void smi_refresh_dma_command(struct bcm2835_smi_instance *smi_inst,
                                            int num_transfers)
 {
-    /* SMIL can only be latched when ACTIVE==0 */
-    if (smi_is_active(smi_inst))
-        return;
-
-    /* Give a long window (N quarters) so DREQ keeps flowing. */
     u32 len = (u32)SMI_REFRESH_CHUNKS * num_transfers;
     if (len > 0x00FFFFFF) len = 0x00FFFFFF;   /* SMIL is effectively 24-bit */
     write_smi_reg(smi_inst, len, SMIL);
 
-    /* START latches the new SMIL value and re-activates the peripheral. */
+    /* START is safe to pulse repeatedly; it latches SMIL when ACTIVE==0. */
     u32 smics = read_smi_reg(smi_inst, SMICS);
     smics |= SMICS_START;
     write_smi_reg(smi_inst, smics, SMICS);
@@ -745,11 +746,11 @@ static long smi_stream_ioctl(struct file *file, unsigned int cmd, unsigned long 
              * garbage in SMIDSR0 (read timing).  Re-apply our known-good
              * values after it runs.  smi_setup_clock() is guarded by
              * SMI_SETUP_CLOCK_ENABLE and will no-op if disabled. */
-            dev_info(inst->dev, "v2.3.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.5.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
             smi_setup_clock(inst->smi_inst);
-            dev_info(inst->dev, "v2.3.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.5.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
         }
@@ -907,12 +908,6 @@ static void stream_smi_read_dma_callback(void *param)
     struct bcm2835_smi_instance *smi_inst = inst->smi_inst;
     uint8_t *buffer_pos;
 
-    /* Top-up only every ~SMI_REFRESH_CHUNKS quarters */
-    // if (++inst->count_since_refresh >= (SMI_REFRESH_CHUNKS - SMI_TOPUP_MARGIN)) {
-    //     smi_refresh_dma_command(smi_inst, DMA_BOUNCE_BUFFER_SIZE/4);
-    //     inst->count_since_refresh = 0;
-    // }
-
     /* Always ensure SMIL stays well above zero */
     smi_refresh_dma_command(smi_inst, DMA_BOUNCE_BUFFER_SIZE/4);
 
@@ -925,9 +920,20 @@ static void stream_smi_read_dma_callback(void *param)
         inst->counter_missed++;
     }
 
+    /* Periodic debug: every 100 callbacks (~1.6s at typical rates) */
     if (!(inst->current_read_chunk % 100)) {
-        dev_info(inst->dev, "init programmed read. missed:%u, sema %u",
-                 inst->counter_missed, smi_inst->bounce.callback_sem.count);
+        u32 smics = read_smi_reg(smi_inst, SMICS);
+        u32 smil  = read_smi_reg(smi_inst, SMIL);
+        u32 first_word = *(u32 *)buffer_pos;
+        dev_info(inst->dev,
+                 "rx_cb #%u: missed=%u sema=%u fifo_len=%u fifo_avail=%u "
+                 "SMICS=%08X SMIL=%u data[0]=%08X",
+                 inst->current_read_chunk,
+                 inst->counter_missed,
+                 smi_inst->bounce.callback_sem.count,
+                 kfifo_len(&inst->rx_fifo),
+                 kfifo_avail(&inst->rx_fifo),
+                 smics, smil, first_word);
     }
 
     up(&smi_inst->bounce.callback_sem);
@@ -1307,8 +1313,16 @@ int transfer_thread_init(struct bcm2835_smi_dev_instance *inst,
 
     inst->transfer_thread_running = 1;
 
-    dev_info(inst->dev, "smi_init_cyclic_transfer active...");
-    print_smil_registers_ext("post init (cyclic)");
+    dev_info(inst->dev, "smi_init_cyclic_transfer active, dir=%s "
+             "SMICS=%08X SMIL=%08X SMIDSR0=%08X SMIDSW0=%08X "
+             "bounce_buf=%px q=%u",
+             (dir == DMA_DEV_TO_MEM) ? "RX" : "TX",
+             read_smi_reg(inst->smi_inst, SMICS),
+             read_smi_reg(inst->smi_inst, SMIL),
+             read_smi_reg(inst->smi_inst, SMIDSR0),
+             read_smi_reg(inst->smi_inst, SMIDSW0),
+             inst->smi_inst->bounce.buffer[0],
+             (u32)(DMA_BOUNCE_BUFFER_SIZE / 4));
     return 0;
 }
 
@@ -1409,10 +1423,11 @@ static ssize_t smi_stream_read_file_fifo(struct file *file, char __user *buf, si
 {
     int ret = 0;
     unsigned int copied = 0;
-    
+    static unsigned int read_call_cnt = 0;
+
     if (buf == NULL)
     {
-        //dev_info(inst->dev, "Flushing internal rx_kfifo");
+        dev_info(inst->dev, "read: flushing rx_kfifo");
         if (mutex_lock_interruptible(&inst->read_lock))
         {
             return -EINTR;
@@ -1422,14 +1437,20 @@ static ssize_t smi_stream_read_file_fifo(struct file *file, char __user *buf, si
         inst->invalidate_rx_buffers = 1;
         return 0;
     }
-    
+
     if (mutex_lock_interruptible(&inst->read_lock))
     {
         return -EINTR;
     }
     ret = kfifo_to_user(&inst->rx_fifo, buf, count, &copied);
     mutex_unlock(&inst->read_lock);
-    
+
+    /* Log every 200th read call to avoid flooding */
+    if (!(read_call_cnt++ % 200)) {
+        dev_info(inst->dev, "read: req=%zu copied=%u ret=%d fifo_len=%u state=%d",
+                 count, copied, ret, kfifo_len(&inst->rx_fifo), inst->state);
+    }
+
     return ret < 0 ? ret : (ssize_t)copied;
 }
 
@@ -1461,21 +1482,31 @@ static ssize_t smi_stream_write_file(struct file *f, const char __user *user_ptr
 static unsigned int smi_stream_poll(struct file *filp, struct poll_table_struct *wait)
 {
     __poll_t mask = 0;
+    static unsigned int poll_cnt = 0;
 
     poll_wait(filp, &inst->poll_event, wait);
-    
+
     if (!kfifo_is_empty(&inst->rx_fifo))
     {
-        //dev_info(inst->dev, "poll_wait result => readable=%d", inst->readable);
         inst->readable = false;
         mask |= ( POLLIN | POLLRDNORM );
     }
-    
+
     if (!kfifo_is_full(&inst->tx_fifo))
     {
-        //dev_info(inst->dev, "poll_wait result => writeable=%d", inst->writeable);
         inst->writeable = false;
         mask |= ( POLLOUT | POLLWRNORM );
+    }
+
+    /* Log every 500th poll to avoid flooding */
+    if (!(poll_cnt++ % 500)) {
+        dev_info(inst->dev, "poll: mask=%04X rx_empty=%d rx_len=%u tx_full=%d state=%d readable=%d",
+                 mask,
+                 kfifo_is_empty(&inst->rx_fifo),
+                 kfifo_len(&inst->rx_fifo),
+                 kfifo_is_full(&inst->tx_fifo),
+                 inst->state,
+                 inst->readable);
     }
 
     return mask;
@@ -1624,7 +1655,7 @@ static int smi_stream_dev_probe(struct platform_device *pdev)
 
     smi_setup_clock(inst->smi_inst);
 
-    dev_info(dev, "smi-stream-dev v2.3.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
+    dev_info(dev, "smi-stream-dev v2.5.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
              read_smi_reg(inst->smi_inst, SMIDSR0),
              read_smi_reg(inst->smi_inst, SMIDSW0));
 
