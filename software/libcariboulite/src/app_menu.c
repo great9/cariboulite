@@ -44,7 +44,7 @@ _Static_assert(CARIBOU_SMI_BYTES_PER_SAMPLE == sizeof(caribou_smi_sample_complex
 #include <rffc507x.h>
 
 // include here, for testing
-#define SOURCE "/home/pi/src/cariboulite/firmware/top.bin"
+#define SOURCE "firmware/top.bin"
 
 
 
