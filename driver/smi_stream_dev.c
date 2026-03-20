@@ -424,10 +424,60 @@ static int set_state(smi_stream_state_en new_state)
     return ret;
 }
 
-/***************************************************************************/
+/*
+ * SMI clock & timing setup.
+ *
+ * On kernel 6.12 the parent bcm2835-smi driver leaves the SMI peripheral
+ * clock at the raw oscillator rate (125 MHz on RPi4).  The FPGA expects
+ * SOE/SWE strobes at ~16 MHz (see firmware/io.pcf constraints).
+ *
+ * With 125 MHz SMI_CLK the strobe period is:
+ *     T_byte = (setup + strobe + hold + pace) * 8 ns
+ *
+ * To hit ~16 MHz we need ~8 cycles per byte:
+ *     setup=1  strobe=5  hold=1  pace=1  → 8 cycles → 15.625 MHz
+ *
+ * Set SMI_SETUP_CLOCK_ENABLE to 0 to disable this entirely if the parent
+ * driver (or a future kernel) already provides the correct configuration.
+ */
+#define SMI_SETUP_CLOCK_ENABLE  1
+
+/* Target timing values for 125 MHz SMI_CLK → ~15.6 MHz strobe rate.
+ * Adjust these if the SMI_CLK source changes. */
+#define SMI_CLK_SETUP   1
+#define SMI_CLK_STROBE  5
+#define SMI_CLK_HOLD    1
+#define SMI_CLK_PACE    1
+
 static void smi_setup_clock(struct bcm2835_smi_instance *inst)
 {
+#if SMI_SETUP_CLOCK_ENABLE
+    u32 dsr, dsw;
 
+    /* Read current register values to preserve width/mode/dreq bits */
+    dsr = read_smi_reg(inst, SMIDSR0);
+    dsw = read_smi_reg(inst, SMIDSW0);
+
+    /* Patch read timing fields */
+    dsr &= ~(SMIDSR_RSETUP_MASK | SMIDSR_RSTROBE_MASK |
+              SMIDSR_RHOLD_MASK  | SMIDSR_RPACE_MASK);
+    dsr |= (SMI_CLK_SETUP  << SMIDSR_RSETUP_OFFS)  |
+            (SMI_CLK_STROBE << SMIDSR_RSTROBE_OFFS) |
+            (SMI_CLK_HOLD   << SMIDSR_RHOLD_OFFS)   |
+            (SMI_CLK_PACE   << SMIDSR_RPACE_OFFS);
+
+    /* Patch write timing fields */
+    dsw &= ~(SMIDSW_WSETUP_MASK | SMIDSW_WSTROBE_MASK |
+              SMIDSW_WHOLD_MASK  | SMIDSW_WPACE_MASK);
+    dsw |= (SMI_CLK_SETUP  << SMIDSW_WSETUP_OFFS)  |
+            (SMI_CLK_STROBE << SMIDSW_WSTROBE_OFFS) |
+            (SMI_CLK_HOLD   << SMIDSW_WHOLD_OFFS)   |
+            (SMI_CLK_PACE   << SMIDSW_WPACE_OFFS);
+
+    write_smi_reg(inst, dsr, SMIDSR0);
+    write_smi_reg(inst, dsw, SMIDSW0);
+    mb();
+#endif
 }
 
 /***************************************************************************/
