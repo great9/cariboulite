@@ -1119,7 +1119,10 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
             .tx_control_with_iq_if = false,
             .radio09_mode = at86rf215_iq_if_mode,
             .radio24_mode = at86rf215_iq_if_mode,
-            .clock_skew = at86rf215_iq_clock_data_skew_4_906ns,
+            //.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
+            //.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
+            .clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02
+            //.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
         };
         
         // Setup the IQ stream properties
@@ -1129,7 +1132,10 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
             modem_iq_config.radio09_mode = at86rf215_iq_if_mode;
             //modem_iq_config.radio24_mode = at86rf215_baseband_mode; // both radios need to be in iq_if mode
             modem_iq_config.radio24_mode = at86rf215_iq_if_mode;
-            modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_4_906ns;
+            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
+            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
+            modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02
+            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
             smi_state = smi_stream_rx_channel_0;
         }
         else if (radio->smi_channel_id == caribou_smi_channel_2400)
@@ -1137,7 +1143,10 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
             //modem_iq_config.radio09_mode = at86rf215_baseband_mode;  // both radios need to be in iq_if mode
             modem_iq_config.radio09_mode = at86rf215_iq_if_mode;
             modem_iq_config.radio24_mode = at86rf215_iq_if_mode;
-            modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_4_906ns;
+            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
+            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
+            modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02
+            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
             smi_state = smi_stream_rx_channel_1;
         }
         
@@ -1184,8 +1193,10 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
             //.tx_control_with_iq_if = radio->tx_control_with_iq_if, // we always use the modem tx control
             .radio09_mode = at86rf215_iq_if_mode,
             .radio24_mode = at86rf215_iq_if_mode,
-            .clock_skew = at86rf215_iq_clock_data_skew_2_906ns,
-            
+            //.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
+            //.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
+            .clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02
+            //.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
         };
         at86rf215_setup_iq_if(&radio->sys->modem, &modem_iq_config);
 

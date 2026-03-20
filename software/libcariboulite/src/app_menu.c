@@ -3175,7 +3175,6 @@ void monitor_modem_status(sys_st *sys)
     cariboulite_radio_set_tx_samp_cutoff_flt(radio, tx_sr);
     cariboulite_radio_set_rx_bandwidth_flt(radio,rx_bw);
     cariboulite_radio_set_rx_sample_rate_flt(radio, rx_sr);
-
 	HW_UNLOCK();
 	
 	time_t current_time;
@@ -3509,7 +3508,13 @@ void monitor_modem_status(sys_st *sys)
 		
 		if(key == 'q') // Press 'q' to exit
 		{
-			break;
+			if (rx_pipeline_running(&rxp)) {
+                rx_pipeline_stop(&rxp);
+            }
+            if (tx_pipeline_running(&txp)) {
+                tx_pipeline_stop(&txp);
+            }
+            break;
 		}
 
 		if (key == 'x' || key == 'X') {      // reset FIFO diagnostics
@@ -3520,7 +3525,6 @@ void monitor_modem_status(sys_st *sys)
         // --- T: toggle TX ---
         if (key == 't') {
             if (!tx_pipeline_running(&txp)) {
-                // ensure RX is off (pipeline start already does this defensively)
                 rx_pipeline_stop(&rxp);
                 tx_pipeline_start(&txp);
             } else {
