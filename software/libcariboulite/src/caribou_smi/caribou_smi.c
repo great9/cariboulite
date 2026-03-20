@@ -167,23 +167,23 @@ static int caribou_smi_get_smi_settings(caribou_smi_st *dev, struct smi_settings
 static int caribou_smi_setup_settings (caribou_smi_st* dev, struct smi_settings *settings, bool print)
 {
     // SMI_CLK is 125 MHz on kernel 6.12 (RPi4, undivided oscillator).
-    // Target SOE/SWE strobe rate ~16 MHz: need 8 cycles per byte.
-    // 125 MHz / (1+5+1+1) = 15.625 MHz
+    // With (1+3+1+0)=5 cycles → 25 MHz strobe rate → 25 MB/s throughput.
+    // This exceeds the 16 MB/s needed for 4 MSPS × 4 bytes/sample.
     //
-    // IMPORTANT: the parent bcm2835-smi driver on kernel 6.12 produces
-    // garbage in SMIDSR0 (read timing) when applying these via ioctl.
-    // The smi_stream_dev driver re-applies correct values via
-    // smi_setup_clock() after every bcm2835_smi_set_regs_from_settings()
-    // call (guarded by SMI_SETUP_CLOCK_ENABLE).
+    // NOTE: the FPGA PCF constrains SOE/SWE at 16 MHz, but 25 MHz works
+    // in practice.  Slowing to 16 MHz (strobe=5, pace=1) causes RX
+    // throughput starvation.  If SMI_CLK changes on a future kernel,
+    // enable SMI_SETUP_CLOCK_ENABLE in smi_stream_dev.c and adjust
+    // the SMI_CLK_* defines to maintain >= 20 MHz strobe rate.
     settings->read_setup_time = 1;
-    settings->read_strobe_time = 5;
+    settings->read_strobe_time = 3;
     settings->read_hold_time = 1;
-    settings->read_pace_time = 1;
+    settings->read_pace_time = 0;
 
     settings->write_setup_time = 1;
-    settings->write_strobe_time = 5;
+    settings->write_strobe_time = 3;
     settings->write_hold_time = 1;
-    settings->write_pace_time = 1;
+    settings->write_pace_time = 0;
 
 	// 8 bit on each transmission (4 TRX per sample)
     settings->data_width = SMI_WIDTH_8BIT;

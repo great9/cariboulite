@@ -440,7 +440,7 @@ static int set_state(smi_stream_state_en new_state)
  * Set SMI_SETUP_CLOCK_ENABLE to 0 to disable this entirely if the parent
  * driver (or a future kernel) already provides the correct configuration.
  */
-#define SMI_SETUP_CLOCK_ENABLE  1
+#define SMI_SETUP_CLOCK_ENABLE  0
 
 /* Target timing values for 125 MHz SMI_CLK → ~15.6 MHz strobe rate.
  * Adjust these if the SMI_CLK source changes. */
@@ -745,11 +745,11 @@ static long smi_stream_ioctl(struct file *file, unsigned int cmd, unsigned long 
              * garbage in SMIDSR0 (read timing).  Re-apply our known-good
              * values after it runs.  smi_setup_clock() is guarded by
              * SMI_SETUP_CLOCK_ENABLE and will no-op if disabled. */
-            dev_info(inst->dev, "v2.2.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.3.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
             smi_setup_clock(inst->smi_inst);
-            dev_info(inst->dev, "v2.2.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.3.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
         }
@@ -1624,7 +1624,7 @@ static int smi_stream_dev_probe(struct platform_device *pdev)
 
     smi_setup_clock(inst->smi_inst);
 
-    dev_info(dev, "smi-stream-dev v2.2.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
+    dev_info(dev, "smi-stream-dev v2.3.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
              read_smi_reg(inst->smi_inst, SMIDSR0),
              read_smi_reg(inst->smi_inst, SMIDSW0));
 
