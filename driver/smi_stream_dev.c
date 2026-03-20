@@ -458,21 +458,22 @@ static void smi_setup_clock(struct bcm2835_smi_instance *inst)
     dsr = read_smi_reg(inst, SMIDSR0);
     dsw = read_smi_reg(inst, SMIDSW0);
 
-    /* Patch read timing fields */
-    dsr &= ~(SMIDSR_RSETUP_MASK | SMIDSR_RSTROBE_MASK |
-              SMIDSR_RHOLD_MASK  | SMIDSR_RPACE_MASK);
-    dsr |= (SMI_CLK_SETUP  << SMIDSR_RSETUP_OFFS)  |
-            (SMI_CLK_STROBE << SMIDSR_RSTROBE_OFFS) |
-            (SMI_CLK_HOLD   << SMIDSR_RHOLD_OFFS)   |
-            (SMI_CLK_PACE   << SMIDSR_RPACE_OFFS);
+    /* Build complete register values — don't rely on read-modify-write
+     * because the parent driver may leave garbage in the register.
+     * Force 8-bit width, DREQ enabled, all timing fields explicit. */
+    dsr = (0 << SMIDSR_RWIDTH_OFFS)                |   /* 8-bit */
+          (SMI_CLK_SETUP  << SMIDSR_RSETUP_OFFS)   |
+          (SMI_CLK_STROBE << SMIDSR_RSTROBE_OFFS)   |
+          (SMI_CLK_HOLD   << SMIDSR_RHOLD_OFFS)     |
+          (SMI_CLK_PACE   << SMIDSR_RPACE_OFFS)     |
+          SMIDSR_RDREQ;                                 /* DMA pacing */
 
-    /* Patch write timing fields */
-    dsw &= ~(SMIDSW_WSETUP_MASK | SMIDSW_WSTROBE_MASK |
-              SMIDSW_WHOLD_MASK  | SMIDSW_WPACE_MASK);
-    dsw |= (SMI_CLK_SETUP  << SMIDSW_WSETUP_OFFS)  |
-            (SMI_CLK_STROBE << SMIDSW_WSTROBE_OFFS) |
-            (SMI_CLK_HOLD   << SMIDSW_WHOLD_OFFS)   |
-            (SMI_CLK_PACE   << SMIDSW_WPACE_OFFS);
+    dsw = (0 << SMIDSW_WWIDTH_OFFS)                |   /* 8-bit */
+          (SMI_CLK_SETUP  << SMIDSW_WSETUP_OFFS)   |
+          (SMI_CLK_STROBE << SMIDSW_WSTROBE_OFFS)   |
+          (SMI_CLK_HOLD   << SMIDSW_WHOLD_OFFS)     |
+          (SMI_CLK_PACE   << SMIDSW_WPACE_OFFS)     |
+          SMIDSW_WDREQ;
 
     write_smi_reg(inst, dsr, SMIDSR0);
     write_smi_reg(inst, dsw, SMIDSW0);
@@ -744,11 +745,11 @@ static long smi_stream_ioctl(struct file *file, unsigned int cmd, unsigned long 
              * garbage in SMIDSR0 (read timing).  Re-apply our known-good
              * values after it runs.  smi_setup_clock() is guarded by
              * SMI_SETUP_CLOCK_ENABLE and will no-op if disabled. */
-            dev_info(inst->dev, "v2.1.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.2.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
             smi_setup_clock(inst->smi_inst);
-            dev_info(inst->dev, "v2.1.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.2.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
         }
@@ -1623,7 +1624,7 @@ static int smi_stream_dev_probe(struct platform_device *pdev)
 
     smi_setup_clock(inst->smi_inst);
 
-    dev_info(dev, "smi-stream-dev v2.1.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
+    dev_info(dev, "smi-stream-dev v2.2.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
              read_smi_reg(inst->smi_inst, SMIDSR0),
              read_smi_reg(inst->smi_inst, SMIDSW0));
 
