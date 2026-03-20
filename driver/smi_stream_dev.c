@@ -1574,10 +1574,11 @@ static int smi_stream_dev_probe(struct platform_device *pdev)
     inst->tx_watch_last_active = false;
     inst->tx_watch_min_smil = 0;
     /* TX SMIL keepalive: check ACTIVE frequently so idle gaps are ~eliminated.
-       Start with 5 µs; you can relax later if stable. */
+       50 µs keeps scheduler overhead low on kernel 6.12+ while still
+       catching SMIL drain before a full underrun at typical data rates. */
     hrtimer_init(&inst->tx_hr, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
     inst->tx_hr.function = tx_hr_keepalive;
-    inst->tx_hr_period   = ktime_set(0, 5 * 1000);  /* 5 µs */
+    inst->tx_hr_period   = ktime_set(0, 50 * 1000);  /* 50 µs */
 
     return 0;
 }
