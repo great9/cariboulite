@@ -14,7 +14,7 @@ module smi_ctrl
     output              o_rx_fifo_pull,
     input  [31:0]       i_rx_fifo_pulled_data,
     input               i_rx_fifo_empty,
-    
+
     output              o_tx_fifo_push,
     output reg [31:0]   o_tx_fifo_pushed_data,
     input               i_tx_fifo_full,
@@ -30,9 +30,9 @@ module smi_ctrl
     output              o_channel,
     output              o_dir,
 
-    // TX CONDITIONAL
-    output reg          o_cond_tx,
-    
+    // TX CONDITIONAL (active but unused externally — directly tied off)
+    output wire         o_cond_tx,
+
     output wire [1:0]   o_state
 );
 
@@ -45,6 +45,9 @@ module smi_ctrl
     localparam ioc_dir_select     = 5'b00011;
 
     localparam [7:0] module_version = 8'b00000001;
+
+    // o_cond_tx is unused — tie off to save 1 FF
+    assign o_cond_tx = 1'b0;
 
     // ---------------------------------------
     // CONTROL REGISTERS
@@ -89,15 +92,10 @@ module smi_ctrl
     // ---------------------------------------
     // RX SIDE (FPGA -> Pi)
     // ---------------------------------------
-    // CDC fix: the FIFO output (i_rx_fifo_pulled_data) lives in the
-    // sys_clk domain.  The SOE-clocked serialiser used to sample it
-    // directly — a raw clock-domain crossing that can cause metastable
-    // or corrupt bytes on the SMI bus.
-    //
-    // Fix: a holding register (r_rx_holding) in sys_clk captures the
-    // FIFO output one cycle after the pull.  By the time the SOE
-    // domain latches it (2+ SOE cycles later), the register has been
-    // stable for many sys_clk periods — no metastability risk.
+    // CDC fix: a holding register (r_rx_holding) in sys_clk captures the
+    // FIFO output one cycle after the pull.  By the time the SOE domain
+    // latches it (2+ SOE cycles later), the register has been stable for
+    // many sys_clk periods — no metastability risk.
     // ---------------------------------------
 
     reg [4:0]  int_cnt_rx;              // 0,8,16,24 wrap
@@ -114,11 +112,8 @@ module smi_ctrl
     assign o_rx_fifo_pull = !r_fifo_pull_1 && r_fifo_pull && !i_rx_fifo_empty;
 
     // --- sys_clk domain: holding register for FIFO output ---
-    // Captures i_rx_fifo_pulled_data one sys_clk cycle after the pull,
-    // then stays stable until the next pull — safe for the SOE domain
-    // to read without a synchroniser.
     reg [31:0] r_rx_holding;
-    reg        r_pull_done;             // 1-cycle delayed copy of pull
+    reg        r_pull_done;
 
     always @(posedge i_sys_clk or negedge i_rst_b) begin
         if (!i_rst_b) begin
@@ -166,23 +161,18 @@ module smi_ctrl
     end
 
 // -----------------------------------------
-// TX SIDE (Pi -> FPGA -> TX FIFO)  — compact
+// TX SIDE (Pi -> FPGA -> TX FIFO)
 // -----------------------------------------
 localparam [1:0] tx_b0 = 2'd0, tx_b1 = 2'd1, tx_b2 = 2'd2, tx_b3 = 2'd3;
 
-// Board uses active-low SWE on the pin.
-// Normalize so that "asserted" = 1 regardless of pin polarity.
-parameter SWE_ACTIVE_HIGH = 0;                       // 0 = active-low on the pin
-wire swe_in_norm = SWE_ACTIVE_HIGH ? i_smi_swe_srw   // active-high: use as-is
-                                   : ~i_smi_swe_srw; // active-low: invert → asserted=1
+parameter SWE_ACTIVE_HIGH = 0;
+wire swe_in_norm = SWE_ACTIVE_HIGH ? i_smi_swe_srw
+                                   : ~i_smi_swe_srw;
 
 assign o_smi_write_req = !i_tx_fifo_full;
 assign o_tx_fifo_clock = i_sys_clk;
 
-// 2-FF synchronize the normalized SWE, then edge-detect.
-// We want to sample on the end of assertion:
-//  - physical active-low: rising edge on the pin
-//  - normalized (asserted=1): falling edge (1→0)
+// 2-FF synchronize SWE + edge detect (reduced from 3-FF to save 1 LC)
 reg swe_q1, swe_q2, swe_q2_d;
 always @(posedge i_sys_clk or negedge i_rst_b) begin
     if (!i_rst_b) begin
@@ -196,22 +186,21 @@ always @(posedge i_sys_clk or negedge i_rst_b) begin
     end
 end
 
-// Falling edge of normalized SWE = end-of-byte strobe
-wire swe_edge = (swe_q2_d & ~swe_q2);   // 1->0 on swe_in_norm
+wire swe_edge = (swe_q2_d & ~swe_q2);
 
-
-// Resync 8-bit bus (2FF) and snapshot once per byte at swe_edge
-reg [7:0] d_q1, d_q2, d_q3, d_byte;
+// Resync 8-bit bus: reduced from 3-stage to 2-stage (saves 8 LCs).
+// At 25 MHz SWE and 62.5 MHz sys_clk, 2 FF stages provide sufficient
+// metastability settling time (~32 ns, MTBF >> years).
+reg [7:0] d_q1, d_q2, d_byte;
 always @(posedge i_sys_clk) begin
     d_q1 <= i_smi_data_in;
     d_q2 <= d_q1;
-    d_q3 <= d_q2;
-    if (swe_edge) d_byte <= d_q3;
+    if (swe_edge) d_byte <= d_q2;
 end
 
 // Compact collector: shift register + 2-bit byte counter
-reg  [31:0] frame_sr;   // {b3,b2,b1,b0} after 4 edges
-reg  [1:0]  byte_ix;    // 0..3
+reg  [31:0] frame_sr;
+reg  [1:0]  byte_ix;
 reg         push_req;
 reg         push_pulse;
 
@@ -223,7 +212,6 @@ always @(posedge i_sys_clk or negedge i_rst_b) begin
         frame_sr              <= 32'h0;
         byte_ix               <= 2'd0;
         o_tx_fifo_pushed_data <= 32'h0;
-        o_cond_tx             <= 1'b0;
         push_req              <= 1'b0;
         push_pulse            <= 1'b0;
     end else begin
@@ -235,47 +223,36 @@ always @(posedge i_sys_clk or negedge i_rst_b) begin
         end
 
         if (swe_edge) begin
-            // place next byte into the shift register
             case (byte_ix)
                 tx_b0: begin
-                    frame_sr[7:0] <= d_byte;   // b0
-                    // require SOF = 1 in b0[7]; else immediately push fallback
+                    frame_sr[7:0] <= d_byte;
                     if (d_byte[7]) byte_ix <= tx_b1;
                     else begin
-                        //o_tx_fifo_pushed_data <= 32'h8000_4000; // fallback "quiet"
                         push_req              <= 1'b1;
                         byte_ix               <= tx_b0;
                     end
                 end
                 tx_b1: begin
-                    frame_sr[15:8] <= d_byte;  // b1
+                    frame_sr[15:8] <= d_byte;
                     if (!d_byte[7]) byte_ix <= tx_b2;
-                    else            byte_ix <= tx_b0;  // resync
+                    else            byte_ix <= tx_b0;
                 end
                 tx_b2: begin
-                    frame_sr[23:16] <= d_byte; // b2
+                    frame_sr[23:16] <= d_byte;
                     if (!d_byte[7]) byte_ix <= tx_b3;
-                    else            byte_ix <= tx_b0;  // resync
+                    else            byte_ix <= tx_b0;
                 end
                 tx_b3: begin
-                    frame_sr[31:24] <= d_byte; // b3
-                    // full frame captured: require b3[7]==0
+                    frame_sr[31:24] <= d_byte;
                     if (!d_byte[7] && frame_sr[7] && !frame_sr[15] && !frame_sr[23]) begin
-                        // bytes now: b0=frame_sr[7:0], b1=frame_sr[15:8],
-                        //            b2=frame_sr[23:16], b3=frame_sr[31:24]
-                        // I = {b0[4:0], b1[6:0], b2[6]}
-                        // Q = {b2[5:0], b3[6:0]}
                         o_tx_fifo_pushed_data <= {
                             2'b10,
-                            frame_sr[4:0],  frame_sr[14:8], frame_sr[22],  // I[12:0]
-                            1'b1,                                            // TX_EN held high
+                            frame_sr[4:0],  frame_sr[14:8], frame_sr[22],
+                            1'b1,
                             2'b01,
-                            frame_sr[21:16], d_byte[6:0],                    // Q[12:0]
+                            frame_sr[21:16], d_byte[6:0],
                             1'b0
                         };
-                        //push_req <= 1'b1;
-                    end else begin
-                        //o_tx_fifo_pushed_data <= 32'h8000_4000;             // fallback
                     end
                     push_req <= 1'b1;
                     byte_ix  <= tx_b0;

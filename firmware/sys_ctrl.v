@@ -48,9 +48,6 @@ module sys_ctrl
 
     // MODULE INTERNAL SIGNALS
     // -----------------------
-	reg debug_fifo_push;
-	reg debug_fifo_pull;
-	reg debug_smi_test;
     reg debug_loopback_tx;
     reg [3:0] tx_sample_gap;
     
@@ -64,9 +61,6 @@ module sys_ctrl
     reg tx_sync_09;
     reg tx_sync_24;
 
-	//assign o_debug_fifo_push = debug_fifo_push;
-	//assign o_debug_fifo_pull = debug_fifo_pull;
-	//assign o_debug_smi_test = debug_smi_test;
     assign o_rx_sync_type09 = rx_sync_type09;
     assign o_tx_sync_type09 = tx_sync_type09;
     assign o_rx_sync_type24 = rx_sync_type24;
@@ -84,9 +78,6 @@ module sys_ctrl
     begin
         if (i_rst_b == 1'b0) begin
             o_data_out <= 8'b00000000;
-            debug_fifo_push <= 1'b0;
-            debug_fifo_pull <= 1'b0;
-            debug_smi_test <= 1'b0;
             debug_loopback_tx <= 1'b0;
             tx_sample_gap <= 4'd0;
 
@@ -126,9 +117,6 @@ module sys_ctrl
                 case (i_ioc)
 					//----------------------------------------------
 					ioc_debug_modes: begin
-						debug_fifo_push <= i_data_in[0];
-						debug_fifo_pull <= i_data_in[1];
-						debug_smi_test <= i_data_in[2];
                         debug_loopback_tx <= i_data_in[3];
 					end
                     //----------------------------------------------

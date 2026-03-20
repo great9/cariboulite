@@ -416,7 +416,7 @@ module top (
 
   complex_fifo  #(
       .ADDR_WIDTH(10),   // 1024 samples
-      .DATA_WIDTH(16)  // 2x16 for I and Q 
+      .DATA_WIDTH(16)  // 2x16 for I and Q
   ) rx_fifo (
       .wr_rst_b_i(i_rst_b),
       .wr_clk_i(w_rx_fifo_write_clk),
@@ -452,21 +452,6 @@ module top (
       .o_tx_fsm_state(w_tx_fsm_state)
     );
 
-    //assign io_pmod[0] = ~lvds_clock_buf;
-    //assign io_pmod[1] = w_lvds_tx_d0;
-    //assign io_pmod[2] = w_lvds_tx_d1;
-    //assign io_pmod[0] = w_smi_write_req;
-    //assign io_pmod[1] = i_smi_swe_srw;
-    //assign io_pmod[2] = w_tx_fifo_push;
-    //assign io_pmod[3] = w_smi_tx_state[0];
-    //assign io_pmod[4] = w_smi_tx_state[1];
-    //assign io_pmod[5] = w_tx_fifo_full;
-    //assign io_pmod[6] = w_tx_fifo_empty;
-    //assign io_pmod[7] = w_tx_fifo_pull;
-
-    //assign io_pmod[7:0] = w_smi_data_input;
-    //assign o_smi_write_req = i_smi_swe_srw; // <-removed for new smi_ctrl tx_side
-
     wire w_tx_fifo_full;
     wire w_tx_fifo_empty;
     wire w_tx_fifo_read_clk;
@@ -476,49 +461,15 @@ module top (
     wire [31:0] w_tx_fifo_pulled_data;
     wire [2:0] w_tx_fsm_state;
     
-    // ------------------------------------------------------------
-    // TEMP TX PRODUCER (sys clock domain) — drives FIFO directly
-    // ------------------------------------------------------------
-    localparam TEST_TX = 1'b0;      // set 0 to return to normal
-    reg        tx_test_en;
-    reg [12:0] tx_test_cntr;
-
-    // (optional) throttle so we don't overrun the FIFO if sys_clk >> lvds_clk
-    localparam integer PUSH_EVERY = 1; // push every sys tick; try 4/8 if needed
-    reg [$clog2(PUSH_EVERY)-1:0] push_div;
-
-    always @(posedge w_clock_sys or negedge i_rst_b) begin
-        if (!i_rst_b) begin
-            tx_test_en   <= 1'b1;          // enable generator by default
-            tx_test_cntr <= 32'h0000_0000;
-            push_div     <= '0;
-        end else begin
-            // simple throttle
-            push_div <= push_div + 1'b1;
-
-            if (tx_test_en && !w_tx_fifo_full && (push_div == 0)) begin
-                tx_test_cntr <= tx_test_cntr + 13'h1;   // test pattern
-            end
-        end
-    end
-
-wire        tp_push = tx_test_en && !w_tx_fifo_full && (push_div == 0);
-wire [31:0] tp_data = {2'b10,tx_test_cntr,1'b1,2'b01,tx_test_cntr + 13'd2048,1'b0};  // or a fixed frame you prefer
-
-wire        tx_wr_en   = TEST_TX ? tp_push  : w_tx_fifo_push;
-wire [31:0] tx_wr_data = TEST_TX ? tp_data  : w_tx_fifo_data;
-
 complex_fifo #(
       .ADDR_WIDTH(10),  // 1024 samples
-      .DATA_WIDTH(16)  // 2x16 for I and Q 
+      .DATA_WIDTH(16)  // 2x16 for I and Q
 ) tx_fifo (
       // smi clock is writing
       .wr_rst_b_i(i_rst_b),
       .wr_clk_i(w_clock_sys),
       .wr_en_i(w_tx_fifo_push),
-      //.wr_en_i(tx_wr_en),     // <— was w_tx_fifo_push for test generator
       .wr_data_i(w_tx_fifo_data),
-      //.wr_data_i(tx_wr_data), // <— was w_tx_fifo_data for test generator
       .full_o(w_tx_fifo_full),
 	  
       // lvds clock is pulling (reading)
@@ -529,18 +480,6 @@ complex_fifo #(
       .empty_o(w_tx_fifo_empty)
   );
   
-//   // ------------------------------
-//   // TX FIFO debug taps (put next to tx_fifo)
-//   // ------------------------------
-
-//   // Latch low nibble of the frame written into FIFO (sys clock domain)
-//   reg [3:0] dbg_wr_nib;
-//   always @(posedge w_clock_sys or negedge i_rst_b) begin
-//     if (!i_rst_b) dbg_wr_nib <= 4'h0;
-//       else if (w_tx_fifo_push && !w_tx_fifo_full)
-//         dbg_wr_nib <= w_tx_fifo_data[3:0];
-//   end
-
   wire channel;
   wire w_smi_data_direction;
 
@@ -663,27 +602,5 @@ complex_fifo #(
   );
 
   assign o_smi_read_req  = (w_smi_data_direction) ? w_smi_read_req : w_smi_write_req;
-  //assign o_smi_write_req = 1'bZ;
 
-  //assign o_led0 = w_smi_data_direction;
-  //assign o_led1 = channel;
-
-  //assign io_pmod_out[0] = w_tx_fsm_state[0];
-  //assign io_pmod_out[1] = w_tx_fsm_state[1];
-  //assign io_pmod_out[2] = w_tx_fsm_state[2];
-  //assign io_pmod_out[3] = w_tx_fifo_empty;
-  
-  //assign io_pmod_out[2] = w_smi_tx_state[0];
-  //assign io_pmod_out[3] = w_smi_tx_state[1];
-
-  //assign io_pmod_out[0] = w_tx_fifo_pull;
-  //assign io_pmod_out[1] = w_tx_fifo_push;
-  //assign io_pmod_out[2] = w_tx_fifo_full;
-  //assign io_pmod_out[3] = w_tx_fifo_empty;
-  
-  //assign io_pmod_out[0] = dbg_wr_nib[0];
-  //assign io_pmod_out[1] = dbg_wr_nib[1];
-  //assign io_pmod_out[2] = dbg_wr_nib[2];
-  //assign io_pmod_out[3] = dbg_wr_nib[3];
-  
 endmodule  // top
