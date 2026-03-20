@@ -466,7 +466,7 @@ sudo dnf install make automake gcc gcc-c++ kernel-devel clang bison \
                  qt5-devel python3-devel boost-devel boost-python3-devel eigen3-devel
 ```
 
-Note: All tools will be installed relative to /usr/local
+Note: All tools will be installed relative to ```/usr/local```
 
 Installing the IceStorm Tools (icepack, icebox, iceprog, icetime, chip databases):
 
