@@ -169,6 +169,12 @@ static int caribou_smi_setup_settings (caribou_smi_st* dev, struct smi_settings 
     // SMI_CLK is 125 MHz on kernel 6.12 (RPi4, undivided oscillator).
     // Target SOE/SWE strobe rate ~16 MHz: need 8 cycles per byte.
     // 125 MHz / (1+5+1+1) = 15.625 MHz
+    //
+    // IMPORTANT: the parent bcm2835-smi driver on kernel 6.12 produces
+    // garbage in SMIDSR0 (read timing) when applying these via ioctl.
+    // The smi_stream_dev driver re-applies correct values via
+    // smi_setup_clock() after every bcm2835_smi_set_regs_from_settings()
+    // call (guarded by SMI_SETUP_CLOCK_ENABLE).
     settings->read_setup_time = 1;
     settings->read_strobe_time = 5;
     settings->read_hold_time = 1;

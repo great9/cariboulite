@@ -729,7 +729,7 @@ static long smi_stream_ioctl(struct file *file, unsigned int cmd, unsigned long 
     case BCM2835_SMI_IOC_WRITE_SETTINGS:
     {
         struct smi_settings *settings;
-    
+
         dev_info(inst->dev, "Setting user's SMI settings.");
         settings = bcm2835_smi_get_settings_from_regs(inst->smi_inst);
         if (copy_from_user(settings, (void *)arg, sizeof(struct smi_settings)))
@@ -739,6 +739,18 @@ static long smi_stream_ioctl(struct file *file, unsigned int cmd, unsigned long 
         else
         {
             bcm2835_smi_set_regs_from_settings(inst->smi_inst);
+
+            /* The parent bcm2835-smi driver on kernel 6.12 produces
+             * garbage in SMIDSR0 (read timing).  Re-apply our known-good
+             * values after it runs.  smi_setup_clock() is guarded by
+             * SMI_SETUP_CLOCK_ENABLE and will no-op if disabled. */
+            dev_info(inst->dev, "v2.1.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
+                     read_smi_reg(inst->smi_inst, SMIDSR0),
+                     read_smi_reg(inst->smi_inst, SMIDSW0));
+            smi_setup_clock(inst->smi_inst);
+            dev_info(inst->dev, "v2.1.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
+                     read_smi_reg(inst->smi_inst, SMIDSR0),
+                     read_smi_reg(inst->smi_inst, SMIDSW0));
         }
         break;
     }
@@ -1311,6 +1323,7 @@ void transfer_thread_stop(struct bcm2835_smi_dev_instance *inst)
     //dev_info(inst->dev, "Reader state became idle, terminating smi transaction");
     smi_disable_sync(inst->smi_inst);
     bcm2835_smi_set_regs_from_settings(inst->smi_inst);
+    smi_setup_clock(inst->smi_inst);
     
     //dev_info(inst->dev, "Left reader thread");
     inst->transfer_thread_running = false;
@@ -1610,6 +1623,10 @@ static int smi_stream_dev_probe(struct platform_device *pdev)
 
     smi_setup_clock(inst->smi_inst);
 
+    dev_info(dev, "smi-stream-dev v2.1.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
+             read_smi_reg(inst->smi_inst, SMIDSR0),
+             read_smi_reg(inst->smi_inst, SMIDSW0));
+
     // Streaming instance initializations
     inst->invalidate_rx_buffers = 0;
     inst->invalidate_tx_buffers = 0;
@@ -1688,3 +1705,4 @@ MODULE_ALIAS("platform:smi-stream-dev");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Character device driver for BCM2835's secondary memory interface streaming mode");
 MODULE_AUTHOR("David Michaeli <cariboulabs.co@gmail.com>");
+MODULE_VERSION("2.1.0");
