@@ -691,6 +691,7 @@ int caribou_smi_init(caribou_smi_st* dev,
     dev->debug_mode = caribou_smi_none;
     dev->invert_iq = false;
     dev->sample_rate = CARIBOU_SMI_SAMPLE_RATE;
+    pthread_mutex_init(&dev->tx_lock, NULL);
     dev->initialized = 1;
 
     return 0;
@@ -699,6 +700,8 @@ int caribou_smi_init(caribou_smi_st* dev,
 //=========================================================================
 int caribou_smi_close (caribou_smi_st* dev)
 {
+    pthread_mutex_destroy(&dev->tx_lock);
+
     // release temporary buffers
     if (dev->read_temp_buffer) free(dev->read_temp_buffer);
     if (dev->write_temp_buffer) free(dev->write_temp_buffer);
@@ -895,6 +898,8 @@ static void caribou_smi_generate_data(caribou_smi_st* dev, uint8_t* data, size_t
 int caribou_smi_write(caribou_smi_st* dev, caribou_smi_channel_en channel,
                       caribou_smi_sample_complex_int16* samples, size_t length_samples)
 {
+    pthread_mutex_lock(&dev->tx_lock);
+
     const size_t q_bytes = smi_quarter_bytes(dev);                  // exact DMA period (bytes)
     const size_t bytes_total = length_samples * CARIBOU_SMI_BYTES_PER_SAMPLE;
 
@@ -912,7 +917,7 @@ int caribou_smi_write(caribou_smi_st* dev, caribou_smi_channel_en channel,
 
         // Blocking write of the whole quarter
         if (write_all(dev->filedesc, (uint8_t*)dev->write_temp_buffer, q_bytes) != 0)
-            return (int)wrote_samps; // short on error (never return a partial quarter)
+            goto out; // short on error (never return a partial quarter)
 
         // Track the last IQ we sent (for tail padding later)
         last = samples[wrote_samps + this_samp - 1];
@@ -964,12 +969,14 @@ int caribou_smi_write(caribou_smi_st* dev, caribou_smi_channel_en channel,
 
         // Write the completed quarter
         if (write_all(dev->filedesc, (uint8_t*)dev->write_temp_buffer, q_bytes) != 0)
-            return (int)wrote_samps;
+            goto out;
 
         wrote_samps += this_samp;   // we advanced one full quarter worth of samples
         bytes_left   = 0;
     }
 
+out:
+    pthread_mutex_unlock(&dev->tx_lock);
     return (int)wrote_samps;
 }
 
@@ -1045,6 +1052,8 @@ int caribou_smi_write_samples(caribou_smi_st *dev,
     if (!dev || dev->filedesc < 0 || !samples || n_samples <= 0)
         return -EINVAL;
 
+    pthread_mutex_lock(&dev->tx_lock);
+
     const size_t bps         = (size_t)CARIBOU_SMI_BYTES_PER_SAMPLE;
     const size_t total_bytes = (size_t)n_samples * bps;
 
@@ -1081,7 +1090,8 @@ int caribou_smi_write_samples(caribou_smi_st *dev,
                                               per_try_timeout_ms);
             if (w < 0) {
                 // hard error: return what we did manage to consume so far (in samples) or the error if nothing
-                return (consumed_samples > 0) ? (int)consumed_samples : w;
+                if (consumed_samples == 0) consumed_samples = (size_t)w;
+                goto done;
             }
             if (w == 0) {
                 // just a timeout; allow a few retries before giving up this call
@@ -1116,6 +1126,7 @@ int caribou_smi_write_samples(caribou_smi_st *dev,
     }
 
 done:
+    pthread_mutex_unlock(&dev->tx_lock);
     return (int)consumed_samples;
 }
 
@@ -1159,6 +1170,8 @@ int caribou_smi_start_tx(caribou_smi_st *dev)
     dev->state = smi_stream_tx_channel;
 
     // 2) Prefill a few chunks of steady zeros using the SAME writer
+    pthread_mutex_lock(&dev->tx_lock);
+
     const size_t bps     = (size_t)CARIBOU_SMI_BYTES_PER_SAMPLE;
     const size_t q_bytes = (size_t)(dev->native_batch_len / 4);
     const size_t q_samp  = q_bytes / bps;
@@ -1182,19 +1195,23 @@ int caribou_smi_start_tx(caribou_smi_st *dev)
         if (w <= 0) break; // fine; DMA will pull as it goes
     }
 
+    caribou_smi_tx_accum_reset();
+    pthread_mutex_unlock(&dev->tx_lock);
     return 0;
 }
 
 int caribou_smi_stop(caribou_smi_st *dev) {
 
     if (!dev) return -EINVAL;
+    if (dev->state == smi_stream_idle) return 0;
 
     /* Drop any partial block so next TX starts clean */
-    //caribou_smi_tx_accum_reset();
+    pthread_mutex_lock(&dev->tx_lock);
+    caribou_smi_tx_accum_reset();
+    pthread_mutex_unlock(&dev->tx_lock);
 
-    if (dev->state == smi_stream_idle) return 0;
     if (caribou_smi_set_driver_streaming_state(dev, smi_stream_idle) != 0) return -1;
-    
+
     dev->state = smi_stream_idle;
     return 0;
 }

@@ -71,10 +71,11 @@ typedef struct
 	size_t native_batch_len;
     uint32_t sample_rate;
     smi_stream_state_en state;
-    
+
     uint8_t *read_temp_buffer;
     uint8_t *write_temp_buffer;
-    
+    pthread_mutex_t tx_lock;        // guards write_temp_buffer, g_tx_accum, and TX state
+
     bool invert_iq;
 
 	// debugging
