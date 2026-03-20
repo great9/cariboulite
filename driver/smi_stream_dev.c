@@ -482,14 +482,25 @@ static int smi_disable_sync(struct bcm2835_smi_instance *smi_inst)
 //     print_smil_registers_ext("refresh 3");
 // }
 
-/* Nudge-only refresh: DO NOT modify SMIL here */
+/* Refresh SMIL with a new transfer window and pulse START.
+ * SMIL is only latched by the hardware when ACTIVE==0; writing it
+ * while ACTIVE==1 is silently ignored, wasting the refresh and
+ * leaving SMIL to drain to zero (causing a stall).  Guard the
+ * write so it only happens when the peripheral is idle.
+ */
 static inline void smi_refresh_dma_command(struct bcm2835_smi_instance *smi_inst,
                                            int num_transfers)
 {
-    /* Give a long window (N quarters) so DREQ keeps flowing. */
-    write_smi_reg(smi_inst, SMI_REFRESH_CHUNKS * num_transfers, SMIL);
+    /* SMIL can only be latched when ACTIVE==0 */
+    if (smi_is_active(smi_inst))
+        return;
 
-    /* START (safe to set repeatedly). */
+    /* Give a long window (N quarters) so DREQ keeps flowing. */
+    u32 len = (u32)SMI_REFRESH_CHUNKS * num_transfers;
+    if (len > 0x00FFFFFF) len = 0x00FFFFFF;   /* SMIL is effectively 24-bit */
+    write_smi_reg(smi_inst, len, SMIL);
+
+    /* START latches the new SMIL value and re-activates the peripheral. */
     u32 smics = read_smi_reg(smi_inst, SMICS);
     smics |= SMICS_START;
     write_smi_reg(smi_inst, smics, SMICS);
@@ -1218,18 +1229,21 @@ int transfer_thread_init(struct bcm2835_smi_dev_instance *inst,
 
     /* Enable SMI and arm a long window */
     smi_enable_streaming(inst->smi_inst, dir);
-    //#define SMIL_INIT_QUARTERS  (SMI_REFRESH_CHUNKS * (DMA_BOUNCE_BUFFER_SIZE/4))
-    //const size_t q = DMA_BOUNCE_BUFFER_SIZE / 4;
-    //write_smi_reg(inst->smi_inst, q, SMIL);
-    //write_smi_reg(inst->smi_inst, SMI_REFRESH_CHUNKS * q, SMIL);
-    
+
+    /* Wait for ACTIVE==0 before programming SMIL (hardware requirement) */
+    {
+        int smil_ready = 0;
+        BUSY_WAIT_WHILE_TIMEOUT(smi_is_active(inst->smi_inst), 1000, smil_ready);
+        if (!smil_ready)
+            dev_warn(inst->dev, "SMIL init: ACTIVE still high, SMIL write may be ignored");
+    }
+
     const u32 q   = (u32)(DMA_BOUNCE_BUFFER_SIZE / 4);
     u32 len       = (u32)SMI_REFRESH_CHUNKS * q;    /* long window */
     if (len > 0x00FFFFFF) len = 0x00FFFFFF;         /* SMIL is ~24-bit */
     write_smi_reg(inst->smi_inst, len, SMIL);
-    
 
-    /* One-time START pulse */
+    /* One-time START pulse — latches SMIL and activates the peripheral */
     u32 smics = read_smi_reg(inst->smi_inst, SMICS);
     smics |= SMICS_START;
     write_smi_reg(inst->smi_inst, smics, SMICS);
