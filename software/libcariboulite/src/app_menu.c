@@ -112,7 +112,7 @@ static void* dsp_producer_thread_func(void* arg);
 static void* tx_writer_thread_func(void* arg);
 static void* rx_reader_thread_func(void* arg);
 static void* nbfm_demod_thread(void* arg);
-static void* wbfm_demod_thread(void* arg);
+//static void* wbfm_demod_thread(void* arg);
 static void* audio_writer_thread(void* arg);
 
 //=================================================
