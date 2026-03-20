@@ -502,7 +502,9 @@ Then run the following:
 sudo apt install ~/Downloads/sdrpp_debian_bookworm_aarch64.db
 ```
 
-### Build from source
+### Build from source (only option if you want Soapy and/or SDRplay)
+Prior to building from source, I believe it is nessecary to atleast once run ```SoapySDRUtil --find``` else the build process for SDR++ doesn't find the required libraries and will skill the inclusion of Soapy_Source.
+If you are interested in using the SDRplay devices, you need to ensure the prorietary API library is installed, before proceding with the build
 
 Get the source code:
 
@@ -520,7 +522,7 @@ mkdir build && cd build
 ```
 
 ```
-cmake  -DOPT_BUILD_SOAPY_SOURCE=ON -DOPT_BUILD_HERMES_SOURCE=ON -DOPT_BUILD_PLUTOSDR_SOURCE=OFF -DOPT_BUILD_AIRSPY_SOURCE=OFF -DOPT_BUILD_AIRSPYHF_SOURCE=OFF -DOPT_BUILD_HACKRF_SOURCE=OFF -DOPT_BUILD_RTL_SDR_SOURCE=OFF ..
+cmake .. -DOPT_BUILD_SOAPY_SOURCE=ON -DOPT_BUILD_HERMES_SOURCE=ON -DOPT_BUILD_SDRPLAY_SOURCE=OFF -DOPT_BUILD_PLUTOSDR_SOURCE=OFF -DOPT_BUILD_AIRSPY_SOURCE=OFF -DOPT_BUILD_AIRSPYHF_SOURCE=OFF -DOPT_BUILD_HACKRF_SOURCE=OFF -DOPT_BUILD_RTL_SDR_SOURCE=OFF
 ```
 
 ```
