@@ -508,7 +508,6 @@ void Cariboulite::setFrequency( const int direction, const size_t channel, const
     else
     {
         SoapySDR_logf(SOAPY_SDR_ERROR, "setFrequency dir: %d, channel: %ld, freq: %.2f FAILED", direction, channel, frequency);
-        throw std::runtime_error("setFrequency failed for " + std::to_string(frequency) + " Hz");
     }
 }
 
