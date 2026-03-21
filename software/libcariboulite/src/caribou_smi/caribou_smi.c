@@ -809,51 +809,40 @@ int caribou_smi_read(caribou_smi_st* dev, caribou_smi_channel_en channel,
     return read_so_far;
 }
 
-#define SMI_TX_SAMPLE_SOF               (1<<2)
-#define SMI_TX_SAMPLE_MODEM_TX_CTRL     (1<<1)
-#define SMI_TX_SAMPLE_COND_TX_CTRL      (1<<0)
-//======helper function====================================================
-void print_binairy32(uint32_t value) {
-    for (int i = 31; i >= 0; --i) {
-        putchar((value & (1 << i)) ? '1' : '0');
-        if (i % 8 == 0 && i != 0) putchar(' ');
-    }
-    putchar('\n');
-}
-//=========================================================================
-static void caribou_smi_generate_data(caribou_smi_st* dev, uint8_t* data, size_t data_length, const caribou_smi_sample_complex_int16* sample_offset)
+/*
+ * TX sample frame format (SMI big-endian wire order: bits[31:24] sent first)
+ *
+ * Byte 0 (bits 31:24): [SOF  TXC  CTX  I12  I11  I10  I9   I8 ]
+ * Byte 1 (bits 23:16): [ 0   I7   I6   I5   I4   I3   I2   I1 ]
+ * Byte 2 (bits 15:8):  [ 0   I0   Q12  Q11  Q10  Q9   Q8   Q7 ]
+ * Byte 3 (bits 7:0):   [ 0   Q6   Q5   Q4   Q3   Q2   Q1   Q0 ]
+ *
+ * SOF (bit 31) = 1 marks byte 0; bits 23, 15, 7 = 0 for bytes 1-3.
+ * FPGA smi_ctrl.v uses bit 7 of each byte for frame sync.
+ *
+ * I[12:0] and Q[12:0] are the upper 13 bits of the signed 16-bit
+ * samples (right-shift by 3), preserving sign in two's complement.
+ */
+static void caribou_smi_generate_data(caribou_smi_st* dev, uint8_t* data,
+                                       size_t data_length,
+                                       const caribou_smi_sample_complex_int16* sample_offset)
 {
-    const caribou_smi_sample_complex_int16* cmplx_vec = sample_offset;  
-    uint32_t *samples = (uint32_t*)(data);
-    
-    // Sample Structure
-    // [                 BYTE 0      ] [           BYTE 1     ] [           BYTE 2        ] [          BYTE 3      ]
-    // [SOF TXC CTX I12 I11 I10 I9 I8] [0 I7 I6 I5 I4 I3 I2 I1] [0 I0 Q12 Q11 Q10 Q9 Q8 Q7] [0 Q6 Q5 Q4 Q3 Q2 Q1 Q0]
-	//   1  0/1 0/1
-    
-    for (unsigned int i = 0; i < (data_length / CARIBOU_SMI_BYTES_PER_SAMPLE); i++)
-    {                    
-        int32_t ii = cmplx_vec[i].i;
-        int32_t qq = cmplx_vec[i].q;
-        ii &= 0x1FFF;
-        qq &= 0x1FFF;
-		
-        uint32_t s = SMI_TX_SAMPLE_SOF | SMI_TX_SAMPLE_MODEM_TX_CTRL | SMI_TX_SAMPLE_COND_TX_CTRL; s <<= 5;
-        s |= (ii >> 8) & 0x1F; s <<= 8;
-        s |= (ii >> 1) & 0x7F; s <<= 2;
-        s |= (ii & 0x1); s <<= 6;
-        s |= (qq >> 7) & 0x3F; s <<= 8;
-        s |= (qq & 0x7F);
-        //s = 0x80000000; // we need only one bit to be correct...
-		
-		//if (i < 2) 
-        //{
-        //    printf("0x%08X   ", s);
-        //    print_binairy32(s);
-        //}  
-        
-        //samples[i] = __builtin_bswap32(s);
-        samples[i] = s; // like this we have 0 missed 'programmed write'.
+    uint32_t *samples = (uint32_t *)data;
+    const unsigned int n = data_length / CARIBOU_SMI_BYTES_PER_SAMPLE;
+
+    for (unsigned int i = 0; i < n; i++)
+    {
+        /* Use unsigned to treat the bit pattern as-is (two's complement) */
+        uint16_t ii = (uint16_t)sample_offset[i].i;
+        uint16_t qq = (uint16_t)sample_offset[i].q;
+
+        /* Take upper 13 bits: preserves sign, discards 3 LSBs */
+        samples[i] = (0xE0u       << 24)        /* SOF=1 TXC=1 CTX=1         */
+                   | ((ii >> 11)  << 24)         /* I[15:11] → bits [28:24]   */
+                   | ((ii >>  4) & 0x7Fu) << 16  /* I[10:4]  → bits [22:16]   */
+                   | ((ii >>  3) & 0x01u) << 14  /* I[3]     → bit  [14]      */
+                   | ((qq >> 10) & 0x3Fu) <<  8  /* Q[15:10] → bits [13:8]    */
+                   | ((qq >>  3) & 0x7Fu);       /* Q[9:3]   → bits [6:0]     */
     }
 }
 
