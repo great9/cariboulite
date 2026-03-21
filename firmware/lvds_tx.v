@@ -73,7 +73,7 @@ module lvds_tx (
             r_phase_count     <= 4'd15;
             r_sync_count      <= sync_duration_frames;
             r_fifo_data       <= zero_frame;
-            r_state           <= INIT;
+            r_state           <= IDLE;
             r_pulled          <= 1'b0;
             r_gap_frame_count <= 4'd0;
             pending_load      <= 1'b0;

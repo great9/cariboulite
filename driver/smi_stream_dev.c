@@ -399,11 +399,21 @@ static int set_state(smi_stream_state_en new_state)
             inst->state = smi_stream_idle;
         }
     } else if (new_state == smi_stream_rx_channel_0 || new_state == smi_stream_rx_channel_1) {
+        /* Reset RX FIFO and semaphore so stale data from previous
+         * frequency/channel doesn't accumulate and bog down the system */
+        if (mutex_lock_interruptible(&inst->read_lock)) {
+            spin_unlock(&inst->state_lock);
+            return -EINTR;
+        }
+        kfifo_reset(&inst->rx_fifo);
+        mutex_unlock(&inst->read_lock);
+        sema_init(&inst->smi_inst->bounce.callback_sem, 0);
+        inst->counter_missed = 0;
+        inst->readable = false;
+
         /* Start cyclic DMA (RX) */
         ret = transfer_thread_init(inst, DMA_DEV_TO_MEM, stream_smi_read_dma_callback);
         if (!ret) {
-            /* Same idea for RX: keep it armed long */
-            //smi_refresh_dma_command(inst->smi_inst, DMA_BOUNCE_BUFFER_SIZE/4);
             inst->state = new_state;
         } else {
             bcm2835_smi_set_address(inst->smi_inst, calc_address_from_state(smi_stream_idle));
@@ -746,11 +756,11 @@ static long smi_stream_ioctl(struct file *file, unsigned int cmd, unsigned long 
              * garbage in SMIDSR0 (read timing).  Re-apply our known-good
              * values after it runs.  smi_setup_clock() is guarded by
              * SMI_SETUP_CLOCK_ENABLE and will no-op if disabled. */
-            dev_info(inst->dev, "v2.5.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.8.0 WRITE_SETTINGS pre-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
             smi_setup_clock(inst->smi_inst);
-            dev_info(inst->dev, "v2.5.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
+            dev_info(inst->dev, "v2.8.0 WRITE_SETTINGS post-fix: SMIDSR0=%08X SMIDSW0=%08X",
                      read_smi_reg(inst->smi_inst, SMIDSR0),
                      read_smi_reg(inst->smi_inst, SMIDSW0));
         }
@@ -907,6 +917,7 @@ static void stream_smi_read_dma_callback(void *param)
     struct bcm2835_smi_dev_instance *inst = param;
     struct bcm2835_smi_instance *smi_inst = inst->smi_inst;
     uint8_t *buffer_pos;
+    bool pushed = false;
 
     /* Always ensure SMIL stays well above zero */
     smi_refresh_dma_command(smi_inst, DMA_BOUNCE_BUFFER_SIZE/4);
@@ -916,6 +927,7 @@ static void stream_smi_read_dma_callback(void *param)
 
     if (kfifo_avail(&inst->rx_fifo) >= DMA_BOUNCE_BUFFER_SIZE/4) {
         kfifo_in(&inst->rx_fifo, buffer_pos, DMA_BOUNCE_BUFFER_SIZE/4);
+        pushed = true;
     } else {
         inst->counter_missed++;
     }
@@ -926,19 +938,24 @@ static void stream_smi_read_dma_callback(void *param)
         u32 smil  = read_smi_reg(smi_inst, SMIL);
         u32 first_word = *(u32 *)buffer_pos;
         dev_info(inst->dev,
-                 "rx_cb #%u: missed=%u sema=%u fifo_len=%u fifo_avail=%u "
+                 "rx_cb #%u: missed=%u fifo=%u/%u "
                  "SMICS=%08X SMIL=%u data[0]=%08X",
                  inst->current_read_chunk,
                  inst->counter_missed,
-                 smi_inst->bounce.callback_sem.count,
                  kfifo_len(&inst->rx_fifo),
-                 kfifo_avail(&inst->rx_fifo),
+                 kfifo_len(&inst->rx_fifo) + kfifo_avail(&inst->rx_fifo),
                  smics, smil, first_word);
     }
 
-    up(&smi_inst->bounce.callback_sem);
-    inst->readable = true;
-    wake_up_interruptible(&inst->poll_event);
+    /* Signal userspace only when data was actually pushed.
+     * Note: the semaphore (callback_sem) is NOT used by the RX read
+     * path — poll/read use poll_event + kfifo checks.  Calling up()
+     * here would just leak semaphore count indefinitely.  The
+     * wake_up_interruptible is what actually unblocks poll(). */
+    if (pushed) {
+        inst->readable = true;
+        wake_up_interruptible(&inst->poll_event);
+    }
     inst->current_read_chunk++;
 }
 static inline void smi_kick_if_idle(struct bcm2835_smi_instance *smi_inst)
@@ -1655,7 +1672,7 @@ static int smi_stream_dev_probe(struct platform_device *pdev)
 
     smi_setup_clock(inst->smi_inst);
 
-    dev_info(dev, "smi-stream-dev v2.5.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
+    dev_info(dev, "smi-stream-dev v2.8.0 probed, SMIDSR0=%08X SMIDSW0=%08X",
              read_smi_reg(inst->smi_inst, SMIDSR0),
              read_smi_reg(inst->smi_inst, SMIDSW0));
 
