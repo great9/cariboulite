@@ -382,7 +382,7 @@ If you decide to checkout the feature/nbfm_rx the menu after running cariboulite
     Choice:   
 
 ```
->note: when the ```cariboulite_test_app```is started, it loads the fpga with the original firmware. This firmware has no TX path! To use the TX options you need to upload the updated firmware first, that is part of the feature/nbfm_tx_tone and/or feature/nbfm_rx branches. You can do this by executing option 0 (Hard reset FPGA) and option 3 (Program FPGA).
+>note: when the ```cariboulite_test_app```is started, it loads the fpga with the original firmware. This firmware has no TX path! To use the TX options you need to upload the updated firmware first, that is part of the feature/nbfm_tx_tone and/or feature/nbfm_rx branches. You can do this by executing option ```[ 0] Hard reset FPGA``` and option ```[ 3] Program FPGA```.
 
 >note: for the options 12 and 14 (R) to work correctly you need to have an audio device attached and configured correctly. It uses ALSA and some of these settings are hard-coded. This is WIP. 14 (T) TX tone should work though, transmitting a 650Hz tone, FM modulated on 430.100 MHz.
 
@@ -424,8 +424,103 @@ with ```T``` you enable TX (650 Hz tone) with ```R``` you enable RX.
 
 >Caution! There is no squelch yet so, when no carrier is present, loud noise is emitted from the speaker or headphones! Redude your volume before you try this!   
 
-###Increase the swapfile size
-During the SDR++ build `make` ran out of memory. Hence I increased the swap file from 512 to 1024.
+#Modifying the firmware (FPGA)
+
+You need some addtional tools such as icestorm, nextpnr and yosys to convert verilog (verilog-2005) in to a file that can be programmed to the Lattice ICE40 FPGA. 
+
+Please install the pre-requisites, icestorm, nextpnr and yosys.
+You can follow the instructions here:https://prjicestorm.readthedocs.io/en/latest/overview.html#where-are-the-tools-how-to-install
+
+```
+@MISC{IceStorm,
+    author = {Claire Wolf and Mathias Lasser},
+    title = {Project IceStorm},
+    howpublished = "\url{https://prjicestorm.readthedocs.io/}"
+}
+```
+Installing prerequisites (this command is for Ubuntu 14.04):
+
+```
+sudo apt-get install build-essential clang bison flex libreadline-dev \
+                     gawk tcl-dev libffi-dev git mercurial graphviz   \
+                     xdot pkg-config python python3 libftdi-dev \
+                     qt5-default python3-dev libboost-all-dev cmake libeigen3-dev
+```
+
+Installing prerequisites (this command is for Debian 13):
+
+```
+sudo apt install build-essential clang bison flex libreadline-dev \
+                     gawk tcl-dev libffi-dev git mercurial graphviz   \
+                     xdot pkg-config python python3 libftdi-dev \
+                     qtbase5-dev qt5-qmake python3-dev libboost-all-dev \
+                     cmake libeigen3-dev
+```
+
+On Fedora 24 the following command installs all prerequisites:
+
+```
+sudo dnf install make automake gcc gcc-c++ kernel-devel clang bison \
+                 flex readline-devel gawk tcl-devel libffi-devel git mercurial \
+                 graphviz python-xdot pkgconfig python python3 libftdi-devel \
+                 qt5-devel python3-devel boost-devel boost-python3-devel eigen3-devel
+```
+
+Note: All tools will be installed relative to ```/usr/local```
+
+Installing the IceStorm Tools (icepack, icebox, iceprog, icetime, chip databases):
+
+```
+git clone https://github.com/YosysHQ/icestorm.git icestorm
+cd icestorm
+make -j$(nproc)
+sudo make install
+```
+
+Installing Arachne-PNR (place&route tool, predecessor to NextPNR):
+
+```
+git clone https://github.com/YosysHQ/arachne-pnr.git arachne-pnr
+cd arachne-pnr
+make -j$(nproc)
+sudo make install
+```
+
+Installing NextPNR (place&route tool, Arachne-PNR replacement):
+
+```
+git clone --recursive https://github.com/YosysHQ/nextpnr nextpnr
+cd nextpnr
+cmake . -B build -DARCH=ice40 -DCMAKE_INSTALL_PREFIX=/usr/local && cmake --build build
+make -j$(nproc)
+cd build
+sudo make install
+```
+
+Installing Yosys (Verilog synthesis):
+
+```
+git clone https://github.com/YosysHQ/yosys.git yosys
+cd yosys
+make -j$(nproc)
+sudo make install
+```
+
+Both place and route tools (Arachne-PNR & NextPNR) convert the IceStorm text chip databases into the respective PNR binary chip databases during build. Always rebuild the PNR tools after updating your IceStorm installation.
+
+Once the tools have been installed, you can modify the firmware and load the program to the FPGA. I typically use these two commands:
+
+```
+make clean
+make build
+```
+and then I use the ```cariboulite_test_app``` to program the FPGA with new firmware through optinions  ```[ 0] Hard reset FPGA``` and ```[ 3] Program FPGA```.
+
+
+#SDR++
+
+###Increase the swapfile size (Pi Zero only?)
+During the SDR++ build `make` ran out of memory (on the Pi Zero?). Hence I increased the swap file from 512 to 1024.
 
 ```
 sudo dphys-swapfile swapoff  
@@ -443,7 +538,6 @@ Or:
 ```
 sudo reboot
 ```
-#SDR++
 
 Install dependencies for SDR++:
 
@@ -477,7 +571,9 @@ Then run the following:
 sudo apt install ~/Downloads/sdrpp_debian_bookworm_aarch64.db
 ```
 
-### Build from source
+### Build from source (only option if you want Soapy and/or SDRplay)
+Prior to building from source, I believe it is nessecary to atleast once run ```SoapySDRUtil --find``` else the build process for SDR++ doesn't find the required libraries and will skill the inclusion of Soapy_Source.
+If you are interested in using the SDRplay devices, you need to ensure the prorietary API library is installed, before proceding with the build
 
 Get the source code:
 
@@ -495,7 +591,7 @@ mkdir build && cd build
 ```
 
 ```
-cmake  -DOPT_BUILD_SOAPY_SOURCE=ON -DOPT_BUILD_HERMES_SOURCE=ON -DOPT_BUILD_PLUTOSDR_SOURCE=OFF -DOPT_BUILD_AIRSPY_SOURCE=OFF -DOPT_BUILD_AIRSPYHF_SOURCE=OFF -DOPT_BUILD_HACKRF_SOURCE=OFF -DOPT_BUILD_RTL_SDR_SOURCE=OFF ..
+cmake .. -DOPT_BUILD_SOAPY_SOURCE=ON -DOPT_BUILD_HERMES_SOURCE=ON -DOPT_BUILD_SDRPLAY_SOURCE=OFF -DOPT_BUILD_PLUTOSDR_SOURCE=OFF -DOPT_BUILD_AIRSPY_SOURCE=OFF -DOPT_BUILD_AIRSPYHF_SOURCE=OFF -DOPT_BUILD_HACKRF_SOURCE=OFF -DOPT_BUILD_RTL_SDR_SOURCE=OFF
 ```
 
 ```
@@ -701,10 +797,58 @@ cariboulite_self_test@cariboulite_setup.c:513 Self-test process finished with er
 
 I have also tried all the other options such as hard reset of the fpga, soft reset of the fpga, reprogramming of the fpga. During the receive test there are always smi sync errors.
 
+#ALSA
+
+ALSA is complicated. To have some flexibility for testing the nbfm modulator and demodulator it can be helpfull to not have to depend on a physical audio device, such as a sound card.This can be done with a ALSA utility: snd_aloop. What I describe here is based on this article:
+
+based on: https://linuxvox.com/blog/linux-without-hardware-soundcard-capture-audio-playback-and-record-it-to-file/
+
+###Prerequisits:
+
+Ensure 
+```alsa-utils```  ```ffmpeg``` ```sox``` 
+are installed.
+
+note :both alsa-utils and ffmpeg, are already part of the Raspberry OS usualy.
+
+###Making the Loopback Module Persistent
+
+The modprobe command loads the module temporarily (it will unload on reboot). To make it persistent:
+
+Create a configuration file in /etc/modules-load.d/ to load the module at boot:
+
+sudo nano /etc/modules-load.d/alsa-loopback.conf  
+Add the following line and save the file:
+
+```snd-aloop```  
+Reboot to test persistence (optional, but recommended):
+
+sudo reboot  
+After reboot, re-run lsmod | grep snd_aloop to confirm the module is loaded.
+
+### Testing TX
+
+To test if the ALSA Loopback device works you can start the cariboulite_test_app, enable tx and in a separate terminal run the following command: ```speaker-test -D plughw:Loopback,0,1 -c 1 -t sine -f 440 -r 48000```. You should now here a 440 Hz tone on a narrow band fm receiver tuned to the correct frequency.
+
+If you want to route the microphone audio of your USB audio device to the caribloulite instead of a test tone, you can use this command: ```arecord -D plughw:4,0 -f S16_LE -c 1 -r 48000 | aplay  -D plughw:Loopback,0,1 -f S16_LE -c 1 -r 48000```.
+
+For some obscure reason the alsaloop command doesn't work for this route.
+
+### Testing RX
+
+Similary you can test rx with the following command to 'route' the audio signal from the Loopback device to the plugged in sound card: ``` arecord -D plughw:Loopback,1,0 -f S16_LE -c 1 -r 48000 | aplay  -D plughw:4,0 -f S16_LE -c 1 -r 48000```.
+
+If faced with ```overruns!!!``` one could also use:
+
+```alsaloop -C plughw:Loopback,1,0 -P plughw:4,0 -r 48000 -c 1 -f S16_LE -t 50000``` 
+
+or 
+
+```arecord -D plughw:Loopback,1,0 -f S16_LE -c 1 -r 48000 --buffer-time=100000 --period-time=25000 | aplay  -D plughw:4,0 -f S16_LE -c 1 -r 48000 --buffer-time=100000 --period-time=25000```
 
 
 
-#GNU-RADIO (WIP)
+# GNU-RADIO (WIP)
 ```
 sudp apt install gnuradio
 ```

@@ -3,8 +3,8 @@ module smi_ctrl
     input               i_rst_b,
     input               i_sys_clk,        // FPGA Clock
 
-    input [4:0]         i_ioc,
-    input [7:0]         i_data_in,
+    input  [4:0]        i_ioc,
+    input  [7:0]        i_data_in,
     output reg [7:0]    o_data_out,
     input               i_cs,
     input               i_fetch_cmd,
@@ -12,9 +12,9 @@ module smi_ctrl
 
     // FIFO INTERFACE
     output              o_rx_fifo_pull,
-    input [31:0]        i_rx_fifo_pulled_data,
+    input  [31:0]       i_rx_fifo_pulled_data,
     input               i_rx_fifo_empty,
-    
+
     output              o_tx_fifo_push,
     output reg [31:0]   o_tx_fifo_pushed_data,
     input               i_tx_fifo_full,
@@ -24,248 +24,242 @@ module smi_ctrl
     input               i_smi_soe_se,
     input               i_smi_swe_srw,
     output reg [7:0]    o_smi_data_out,
-    input [7:0]         i_smi_data_in,
+    input  [7:0]        i_smi_data_in,
     output              o_smi_read_req,
     output              o_smi_write_req,
     output              o_channel,
     output              o_dir,
 
-    // TX CONDITIONAL
-    output reg          o_cond_tx,
-    
-    output wire [1:0]   o_state);
+    // TX CONDITIONAL (active but unused externally — directly tied off)
+    output wire         o_cond_tx,
+
+    output wire [1:0]   o_state
+);
 
     // ---------------------------------
-
     // MODULE SPECIFIC IOC LIST
     // ---------------------------------
-    localparam
-        ioc_module_version  = 5'b00000,     // read only
-        ioc_fifo_status     = 5'b00001,     // read-only
-        ioc_channel_select  = 5'b00010,
-        ioc_dir_select      = 5'b00011;
+    localparam ioc_module_version = 5'b00000;     // read only
+    localparam ioc_fifo_status    = 5'b00001;     // read-only
+    localparam ioc_channel_select = 5'b00010;
+    localparam ioc_dir_select     = 5'b00011;
 
-    // ---------------------------------
-    // MODULE SPECIFIC PARAMS
-    // ---------------------------------
-    localparam
-        module_version  = 8'b00000001;
+    localparam [7:0] module_version = 8'b00000001;
+
+    // o_cond_tx is unused — tie off to save 1 FF
+    assign o_cond_tx = 1'b0;
 
     // ---------------------------------------
-    // MODULE CONTROL
+    // CONTROL REGISTERS
     // ---------------------------------------
+    reg r_channel, r_dir;
+
     assign o_channel = r_channel;
-    assign o_dir = r_dir;
-    always @(posedge i_sys_clk or negedge i_rst_b)
-    begin
-        if (i_rst_b == 1'b0) begin
-            r_dir <= 1'b0;
-            r_channel <= 1'b0;
-        end else begin
-            if (i_cs == 1'b1) begin
-                //=============================================
-                // READ OPERATIONS
-                //=============================================
-                if (i_fetch_cmd == 1'b1) begin
-                    case (i_ioc)
-                        //----------------------------------------------
-                        ioc_module_version: o_data_out <= module_version; // Module Version
+    assign o_dir     = r_dir;
 
-                        //----------------------------------------------
-                        ioc_fifo_status: begin
-                            o_data_out[0] <= i_rx_fifo_empty;
-                            o_data_out[1] <= i_tx_fifo_full;
-                            o_data_out[2] <= r_channel;
-                            o_data_out[3] <= 1'b0;
-                            o_data_out[4] <= r_dir;
-                            o_data_out[7:4] <= 3'b000;
-                        end
-                    endcase
-                end
-                //=============================================
-                // WRITE OPERATIONS
-                //=============================================
-                else if (i_load_cmd == 1'b1) begin
-                    case (i_ioc)
-                        //----------------------------------------------
-                        ioc_channel_select: begin
-                            r_channel <= i_data_in[0];
-                        end
-                        //----------------------------------------------
-                        ioc_dir_select: begin
-                            r_dir <= i_data_in[0];
-                        end
-                    endcase
-                end
+    always @(posedge i_sys_clk or negedge i_rst_b) begin
+        if (!i_rst_b) begin
+            r_dir     <= 1'b0;
+            r_channel <= 1'b0;
+            o_data_out <= 8'h00;
+        end else if (i_cs) begin
+            // READ
+            if (i_fetch_cmd) begin
+                case (i_ioc)
+                    ioc_module_version: o_data_out <= module_version;
+                    ioc_fifo_status: begin
+                        o_data_out[0]   <= i_rx_fifo_empty;
+                        o_data_out[1]   <= i_tx_fifo_full;
+                        o_data_out[2]   <= r_channel;
+                        o_data_out[3]   <= 1'b0;
+                        o_data_out[4]   <= r_dir;
+                        o_data_out[7:5] <= 3'b000;
+                    end
+                    default: o_data_out <= 8'h00;
+                endcase
+            end
+            // WRITE
+            else if (i_load_cmd) begin
+                case (i_ioc)
+                    ioc_channel_select: r_channel <= i_data_in[0];
+                    ioc_dir_select:     r_dir     <= i_data_in[0];
+                    default: ; // no-op
+                endcase
             end
         end
     end
 
+    // ---------------------------------------
+    // RX SIDE (FPGA -> Pi)
+    // ---------------------------------------
+    // CDC fix: a holding register (r_rx_holding) in sys_clk captures the
+    // FIFO output one cycle after the pull.  By the time the SOE domain
+    // latches it (2+ SOE cycles later), the register has been stable for
+    // many sys_clk periods — no metastability risk.
+    // ---------------------------------------
 
-    // ---------------------------------------
-    // RX SIDE
-    // ---------------------------------------
-    reg [4:0] int_cnt_rx;
-    reg [7:0] r_smi_test_count;
-    reg r_fifo_pull;
-    reg r_fifo_pull_1;
-    wire w_fifo_pull_trigger;
-    reg r_channel;
-    reg r_dir;
+    reg [4:0]  int_cnt_rx;              // 0,8,16,24 wrap
+    reg        r_fifo_pull, r_fifo_pull_1;
+    reg        w_fifo_pull_trigger;     // pulse on 2nd byte
     reg [31:0] r_fifo_pulled_data;
 
-    wire soe_and_reset;
-    assign soe_and_reset = i_rst_b & i_smi_soe_se;
-    assign o_smi_read_req = (!i_rx_fifo_empty);
+    wire soe_and_reset = i_rst_b & i_smi_soe_se;
+
+    // Host can read whenever FIFO not empty (unchanged)
+    assign o_smi_read_req = !i_rx_fifo_empty;
+
+    // Make a single-cycle rd_en in sys domain using the 2-FF edge detect
     assign o_rx_fifo_pull = !r_fifo_pull_1 && r_fifo_pull && !i_rx_fifo_empty;
 
-    always @(negedge soe_and_reset)
-    begin
-        if (i_rst_b == 1'b0) begin
-            int_cnt_rx <= 5'd0;
-            r_smi_test_count <= 8'h56;
-            r_fifo_pulled_data <= 32'h00000000;
-        end else begin
-            // trigger the fifo pulling on the second byte
-            w_fifo_pull_trigger <= (int_cnt_rx == 5'd8);
+    // --- sys_clk domain: holding register for FIFO output ---
+    reg [31:0] r_rx_holding;
+    reg        r_pull_done;
 
-            int_cnt_rx <= int_cnt_rx + 8;
-            o_smi_data_out <= r_fifo_pulled_data[int_cnt_rx+7:int_cnt_rx];
-            
-            // update the internal register as soon as we reach the fourth byte
-            if (int_cnt_rx == 5'd24) begin
-                r_fifo_pulled_data <= i_rx_fifo_pulled_data;
-            end
+    always @(posedge i_sys_clk or negedge i_rst_b) begin
+        if (!i_rst_b) begin
+            r_rx_holding <= 32'h0000_0000;
+            r_pull_done  <= 1'b0;
+        end else begin
+            r_pull_done <= o_rx_fifo_pull;
+            if (r_pull_done)
+                r_rx_holding <= i_rx_fifo_pulled_data;
         end
     end
 
-    always @(posedge i_sys_clk)
-    begin
-        if (i_rst_b == 1'b0) begin
-            r_fifo_pull <= 1'b0;
+    // Byte emit on SOE falling edge; request next word while sending byte#1
+    always @(negedge soe_and_reset or negedge i_rst_b) begin
+        if (!i_rst_b) begin
+            int_cnt_rx         <= 5'd0;
+            r_fifo_pulled_data <= 32'h0000_0000;
+            o_smi_data_out     <= 8'h00;
+            w_fifo_pull_trigger<= 1'b0;
+        end else begin
+            // trigger FIFO pull on the *second* byte (int_cnt_rx==8)
+            w_fifo_pull_trigger <= (int_cnt_rx == 5'd8);
+
+            // drive current byte LSB->MSB order
+            o_smi_data_out <= r_fifo_pulled_data[int_cnt_rx +: 8];
+
+            // latch next 32b word from the *holding register* (safe CDC)
+            if (int_cnt_rx == 5'd24)
+                r_fifo_pulled_data <= r_rx_holding;
+
+            // advance byte index: 0,8,16,24, wrap by 5b overflow
+            int_cnt_rx <= int_cnt_rx + 5'd8;
+        end
+    end
+
+    // sync the pull trigger into sys clock and form a 1-cycle pulse
+    always @(posedge i_sys_clk or negedge i_rst_b) begin
+        if (!i_rst_b) begin
+            r_fifo_pull   <= 1'b0;
             r_fifo_pull_1 <= 1'b0;
         end else begin
-            r_fifo_pull <= w_fifo_pull_trigger;
+            r_fifo_pull   <= w_fifo_pull_trigger;
             r_fifo_pull_1 <= r_fifo_pull;
         end
     end
 
-    // -----------------------------------------
-    // TX SIDE
-    // -----------------------------------------
-    localparam
-        tx_state_first  = 2'b00,
-        tx_state_second = 2'b01,
-        tx_state_third  = 2'b10,
-        tx_state_fourth = 2'b11;
+// -----------------------------------------
+// TX SIDE (Pi -> FPGA -> TX FIFO)
+// -----------------------------------------
+localparam [1:0] tx_b0 = 2'd0, tx_b1 = 2'd1, tx_b2 = 2'd2, tx_b3 = 2'd3;
 
-    reg [12:0] int_cnt_tx;
-    reg [31:0] r_fifo_pushed_data;
-    reg [1:0] tx_reg_state;
-    reg modem_tx_ctrl;
-    reg cond_tx_ctrl;
-    reg r_fifo_push;
-    reg r_fifo_push_1;
-    wire w_fifo_push_trigger;
-    wire swe_and_reset;
-    
-    assign o_smi_write_req = !i_tx_fifo_full;
-    assign o_tx_fifo_push = !r_fifo_push_1 && r_fifo_push && !i_tx_fifo_full;
-    assign swe_and_reset = i_rst_b & i_smi_swe_srw;
-    assign o_tx_fifo_clock = i_sys_clk;
-    assign o_state = tx_reg_state;
+parameter SWE_ACTIVE_HIGH = 0;
+wire swe_in_norm = SWE_ACTIVE_HIGH ? i_smi_swe_srw
+                                   : ~i_smi_swe_srw;
 
-    always @(negedge swe_and_reset)
-    begin
-        if (i_rst_b == 1'b0) begin
-            tx_reg_state <= tx_state_first;
-            w_fifo_push_trigger <= 1'b0;
-            r_fifo_pushed_data <= 32'h00000000;
-            modem_tx_ctrl <= 1'b0;
-            cond_tx_ctrl <= 1'b0;
-            
-            // DEBUG
-            int_cnt_tx <= 0;
-            // END_DEBUG
+assign o_smi_write_req = !i_tx_fifo_full;
+assign o_tx_fifo_clock = i_sys_clk;
 
-        end else begin
-            case (tx_reg_state)
-                //----------------------------------------------
-                tx_state_first: 
-                begin
-                    if (i_smi_data_in[7] == 1'b1) begin
-                        r_fifo_pushed_data[31:30] <= 2'b10;
-                        modem_tx_ctrl <= i_smi_data_in[6];
-                        cond_tx_ctrl <= i_smi_data_in[5];
-                        r_fifo_pushed_data[29:25] <= i_smi_data_in[4:0];
-                        tx_reg_state <= tx_state_second;
-                        w_fifo_push_trigger <= 1'b0;
-                    end else begin
-                        // if from some reason we are in the first byte stage and we got
-                        // a byte without '1' on its MSB, that means that we are not synced
-                        // so push a "sync" word into the modem.
-                        cond_tx_ctrl <= 1'b0;
-                        modem_tx_ctrl <= 1'b0;
-                        o_tx_fifo_pushed_data <= 32'h00000000;
-                        w_fifo_push_trigger <= 1'b1;
+// 2-FF synchronize SWE + edge detect (reduced from 3-FF to save 1 LC)
+reg swe_q1, swe_q2, swe_q2_d;
+always @(posedge i_sys_clk or negedge i_rst_b) begin
+    if (!i_rst_b) begin
+        swe_q1   <= 1'b0;
+        swe_q2   <= 1'b0;
+        swe_q2_d <= 1'b0;
+    end else begin
+        swe_q1   <= swe_in_norm;
+        swe_q2   <= swe_q1;
+        swe_q2_d <= swe_q2;
+    end
+end
+
+wire swe_edge = (swe_q2_d & ~swe_q2);
+
+// Resync 8-bit bus: reduced from 3-stage to 2-stage (saves 8 LCs).
+// At 25 MHz SWE and 62.5 MHz sys_clk, 2 FF stages provide sufficient
+// metastability settling time (~32 ns, MTBF >> years).
+reg [7:0] d_q1, d_q2, d_byte;
+always @(posedge i_sys_clk) begin
+    d_q1 <= i_smi_data_in;
+    d_q2 <= d_q1;
+    if (swe_edge) d_byte <= d_q2;
+end
+
+// Compact collector: shift register + 2-bit byte counter
+reg  [31:0] frame_sr;
+reg  [1:0]  byte_ix;
+reg         push_req;
+reg         push_pulse;
+
+assign o_tx_fifo_push = push_pulse;
+
+// pack & push when allowed
+always @(posedge i_sys_clk or negedge i_rst_b) begin
+    if (!i_rst_b) begin
+        frame_sr              <= 32'h0;
+        byte_ix               <= 2'd0;
+        o_tx_fifo_pushed_data <= 32'h0;
+        push_req              <= 1'b0;
+        push_pulse            <= 1'b0;
+    end else begin
+        push_pulse <= 1'b0;
+
+        if (push_req && !i_tx_fifo_full) begin
+            push_pulse <= 1'b1;
+            push_req   <= 1'b0;
+        end
+
+        if (swe_edge) begin
+            case (byte_ix)
+                tx_b0: begin
+                    frame_sr[7:0] <= d_byte;
+                    if (d_byte[7]) byte_ix <= tx_b1;
+                    else begin
+                        push_req              <= 1'b1;
+                        byte_ix               <= tx_b0;
                     end
                 end
-                //----------------------------------------------
-                tx_state_second: 
-                begin
-                    if (i_smi_data_in[7] == 1'b0) begin
-                        r_fifo_pushed_data[24:18] <= i_smi_data_in[6:0];
-                        tx_reg_state <= tx_state_third;
-                    end else begin
-                        tx_reg_state <= tx_state_first;
-                    end
-                    w_fifo_push_trigger <= 1'b0;
+                tx_b1: begin
+                    frame_sr[15:8] <= d_byte;
+                    if (!d_byte[7]) byte_ix <= tx_b2;
+                    else            byte_ix <= tx_b0;
                 end
-                //----------------------------------------------
-                tx_state_third: 
-                begin
-                    if (i_smi_data_in[7] == 1'b0) begin
-                        r_fifo_pushed_data[17] <= i_smi_data_in[6];
-                        r_fifo_pushed_data[16] <= modem_tx_ctrl;
-                        r_fifo_pushed_data[15:14] <= 2'b01;
-                        r_fifo_pushed_data[13:8] <= i_smi_data_in[5:0];
-                        tx_reg_state <= tx_state_fourth;
-                    end else begin
-                        tx_reg_state <= tx_state_first;
-                    end
-                    w_fifo_push_trigger <= 1'b0;
+                tx_b2: begin
+                    frame_sr[23:16] <= d_byte;
+                    if (!d_byte[7]) byte_ix <= tx_b3;
+                    else            byte_ix <= tx_b0;
                 end
-                //----------------------------------------------
-                tx_state_fourth: 
-                begin
-                    if (i_smi_data_in[7] == 1'b0) begin
-                        o_tx_fifo_pushed_data <= {r_fifo_pushed_data[31:8], i_smi_data_in[6:0], 1'b0};
-
-                        //o_tx_fifo_pushed_data <= {i_smi_data_in[6:0], 1'b0, r_fifo_pushed_data[15:8], r_fifo_pushed_data[23:16], r_fifo_pushed_data[31:24]};
-                        o_tx_fifo_pushed_data <= {2'b10, int_cnt_tx, 1'b1, 2'b01, 13'h3F, 1'b0};
-                        int_cnt_tx <= int_cnt_tx + 512;
-                        
-                        w_fifo_push_trigger <= 1'b1;
-                        o_cond_tx <= cond_tx_ctrl;
-                    end else begin
-                        o_tx_fifo_pushed_data <= 32'h00000000;
-                        w_fifo_push_trigger <= 1'b0;
+                tx_b3: begin
+                    frame_sr[31:24] <= d_byte;
+                    if (!d_byte[7] && frame_sr[7] && !frame_sr[15] && !frame_sr[23]) begin
+                        o_tx_fifo_pushed_data <= {
+                            2'b10,
+                            frame_sr[4:0],  frame_sr[14:8], frame_sr[22],
+                            1'b1,
+                            2'b01,
+                            frame_sr[21:16], d_byte[6:0],
+                            1'b0
+                        };
                     end
-                    tx_reg_state <= tx_state_first;
+                    push_req <= 1'b1;
+                    byte_ix  <= tx_b0;
                 end
             endcase
         end
     end
-    
-    always @(posedge i_sys_clk)
-    begin
-        if (i_rst_b == 1'b0) begin
-            r_fifo_push <= 1'b0;
-            r_fifo_push_1 <= 1'b0;
-        end else begin
-            r_fifo_push <= w_fifo_push_trigger;
-            r_fifo_push_1 <= r_fifo_push;
-        end
-    end
+end
 
-endmodule // smi_ctrl
+endmodule

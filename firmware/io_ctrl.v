@@ -15,7 +15,7 @@ module io_ctrl
 	input [3:0]         i_config,
 	output              o_led0,
 	output              o_led1,
-	output [3:0]        o_pmod,
+	//output [3:0]        o_pmod,
 
 	// Analog interfaces
 	output              o_mixer_fm,
@@ -72,10 +72,7 @@ module io_ctrl
     // Digital outputs
     reg         led0_state;
     reg         led1_state;
-    reg [7:0]   pmod_dir_state;
-    reg [3:0]   pmod_state;
     reg [7:0]   rf_pin_state;
-    reg         mixer_en_state;
 
     // Analog parts outputs
     reg         lna_rx_shutdown_state;
@@ -91,7 +88,7 @@ module io_ctrl
     //=========================================================================
     assign o_led0 = led0_state;
     assign o_led1 = led1_state;
-    assign o_pmod = pmod_state;
+    //assign o_pmod = pmod_state;
 
     // Analog interfaces
     assign o_mixer_fm = 1'b0;
@@ -113,8 +110,8 @@ module io_ctrl
         if (i_rst_b == 1'b0) begin
             debug_mode <= debug_mode_none;
             rf_mode <= rf_mode_low_power;
-            led0_state <= 1'b0;
-            led1_state <= 1'b0;
+            led0_state <= 1'b0; // a marker, to show it is my version of the firmware
+            led1_state <= 1'b1;
         end else begin
             if (i_cs == 1'b1) begin
                 //=============================================
@@ -141,18 +138,17 @@ module io_ctrl
 
                         //----------------------------------------------
                         ioc_pmod_dir: begin
-                            o_data_out <= pmod_dir_state;
+                            o_data_out <= 8'h00;
                         end
 
                         //----------------------------------------------
                         ioc_pmod_val: begin
-                            o_data_out[3:0] <= pmod_state;
-                            o_data_out[7:4] <= 4'b0000;
+                            o_data_out <= 8'h00;
                         end
 
                         //----------------------------------------------
                         ioc_rf_pin: begin
-                            o_data_out[0] <= mixer_en_state;
+                            o_data_out[0] <= 1'b0;
                             o_data_out[1] <= lna_rx_shutdown_state;
                             o_data_out[2] <= lna_tx_shutdown_state;
                             o_data_out[3] <= tr_vc_2_state;
@@ -187,12 +183,12 @@ module io_ctrl
 
                         //----------------------------------------------
                         ioc_pmod_dir: begin
-                            pmod_dir_state <= i_data_in;
+                            // pmod output disabled — register removed to save LUTs
                         end
 
                         //----------------------------------------------
                         ioc_pmod_val: begin
-                            pmod_state[3:0] <= i_data_in[3:0];
+                            // pmod output disabled — register removed to save LUTs
                         end
 
                         //----------------------------------------------
@@ -218,7 +214,7 @@ module io_ctrl
             case (rf_mode)
                 //--------------------------------------------------
                 rf_mode_low_power: begin
-                    mixer_en_state <= 1'b0;
+                    // mixer_en output hardwired to 1
                     lna_rx_shutdown_state <= 1'b1;
                     lna_tx_shutdown_state <= 1'b1;
 
@@ -231,7 +227,7 @@ module io_ctrl
 
                 //--------------------------------------------------
                 rf_mode_bypass: begin
-                    mixer_en_state <= 1'b0;
+                    // mixer_en output hardwired to 1
                     lna_rx_shutdown_state <= 1'b1;
                     lna_tx_shutdown_state <= 1'b1;
 
@@ -244,7 +240,7 @@ module io_ctrl
 
                 //--------------------------------------------------
                 rf_mode_rx_lpf: begin
-                    mixer_en_state <= 1'b1;
+                    // mixer_en output hardwired to 1
                     lna_rx_shutdown_state <= 1'b0;
                     lna_tx_shutdown_state <= 1'b1;
 
@@ -257,7 +253,7 @@ module io_ctrl
 
                 //--------------------------------------------------
                 rf_mode_rx_hpf: begin
-                    mixer_en_state <= 1'b1;
+                    // mixer_en output hardwired to 1
                     lna_rx_shutdown_state <= 1'b0;
                     lna_tx_shutdown_state <= 1'b1;
 
@@ -270,7 +266,7 @@ module io_ctrl
 
                 //--------------------------------------------------
                 rf_mode_tx_lpf: begin
-                    mixer_en_state <= 1'b1;
+                    // mixer_en output hardwired to 1
                     lna_rx_shutdown_state <= 1'b1;
                     lna_tx_shutdown_state <= 1'b0;
 
@@ -283,7 +279,7 @@ module io_ctrl
 
                 //--------------------------------------------------
                 rf_mode_tx_hpf: begin
-                    mixer_en_state <= 1'b1;
+                    // mixer_en output hardwired to 1
                     lna_rx_shutdown_state <= 1'b1;
                     lna_tx_shutdown_state <= 1'b0;
 
@@ -296,7 +292,7 @@ module io_ctrl
                 //--------------------------------------------------
             endcase
         end else if (debug_mode == debug_mode_debug) begin
-            mixer_en_state <= rf_pin_state[0];
+            // mixer_en output hardwired to 1
             lna_rx_shutdown_state <= rf_pin_state[1];
             lna_tx_shutdown_state <= rf_pin_state[2];
             tr_vc_2_state <= rf_pin_state[3];
