@@ -87,10 +87,13 @@ std::vector<std::string> Cariboulite::listAntennas( const int direction, const s
 {
 	std::vector<std::string> options;
     if (radio->type == cariboulite_channel_s1g)
+    {
         options.push_back( "TX/RX Sub1GHz" );
+    }
     else if (radio->type == cariboulite_channel_hif)
+    {
         options.push_back( "TX/RX 30MHz-6GHz" );
-
+    }
 	return(options);
 }
 
@@ -136,9 +139,13 @@ void Cariboulite::setGain(const int direction, const size_t channel, const doubl
 {
     if (direction == SOAPY_SDR_RX)
     {
-        bool cur_agc_mode = radio->rx_agc_on;
+        // When the user explicitly sets gain, disable AGC so the
+        // manual value takes effect.  AGC can be re-enabled via
+        // setGainMode(true).
         double clamped = std::max(RX_GAIN_MIN, std::min(value, RX_GAIN_MAX));
-        cariboulite_radio_set_rx_gain_control(radio, cur_agc_mode, clamped);
+        SoapySDR_logf(SOAPY_SDR_INFO, "setGain RX: value=%.1f clamped=%.1f gcw=%d ch=%d",
+                       value, clamped, (int)(clamped / 3.0 + 0.5), radio->type);
+        cariboulite_radio_set_rx_gain_control(radio, false, clamped);
     }
     else if (direction == SOAPY_SDR_TX)
     {
