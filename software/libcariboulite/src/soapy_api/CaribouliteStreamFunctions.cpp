@@ -144,9 +144,14 @@ SoapySDR::Stream *Cariboulite::setupStream(const int direction,
      * The implementation may change switches or power-down components.
      * \param stream the opaque pointer to a stream handle
      */
-void Cariboulite::closeStream(SoapySDR::Stream *stream)
+void Cariboulite::closeStream(SoapySDR::Stream *s)
 {
-    cariboulite_radio_activate_channel(radio, stream->getInnerStreamType(), false);
+    cariboulite_radio_activate_channel(radio, s->getInnerStreamType(), false);
+    if (s == stream)
+    {
+        delete stream;
+        stream = nullptr;
+    }
 }
 
 //========================================================

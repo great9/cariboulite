@@ -20,9 +20,9 @@ void ReaderThread(SoapySDR::Stream* stream)
     
     while (stream->readerThreadRunning())
     {
-        if (!stream->stream_active)
+        if (!stream->stream_active.load())
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
         
@@ -91,8 +91,8 @@ SoapySDR::Stream::Stream(cariboulite_radio_state_st *radio)
 	filt100_q.setup(4e6, 100e3/2);
     
     #if USE_ASYNC
-        reader_thread_running = 1;
-        stream_active = 0;
+        reader_thread_running.store(1);
+        stream_active.store(0);
         reader_thread = new std::thread(ReaderThread, this);
     #endif //USE_ASYNC
 }
@@ -105,9 +105,10 @@ SoapySDR::Stream::~Stream()
 	filter_q = NULL;
     
     #if USE_ASYNC
-        stream_active = 0;
-        reader_thread_running = 0;
-        reader_thread->join();
+        stream_active.store(0);
+        reader_thread_running.store(0);
+        if (reader_thread && reader_thread->joinable())
+            reader_thread->join();
         if (reader_thread) delete reader_thread;
         if (interm_native_buffer1) delete[] interm_native_buffer1;
         if (rx_queue) delete rx_queue;
@@ -199,7 +200,7 @@ int SoapySDR::Stream::WriteSamples(cariboulite_sample_complex_int16* buffer, siz
 int SoapySDR::Stream::WriteSamples(sample_complex_float* buffer, size_t num_elements, long timeout_us)
 {
     num_elements = num_elements > mtu_size ? mtu_size : num_elements;
-    float max_val = 4096.0;
+    float max_val = 4095.0;
 
     for (size_t i = 0; i < num_elements; i++)
     {
@@ -215,7 +216,7 @@ int SoapySDR::Stream::WriteSamples(sample_complex_float* buffer, size_t num_elem
 int SoapySDR::Stream::WriteSamples(sample_complex_double* buffer, size_t num_elements, long timeout_us)
 {
     num_elements = num_elements > mtu_size ? mtu_size : num_elements;
-    double max_val = 4096.0;
+    double max_val = 4095.0;
 
     for (size_t i = 0; i < num_elements; i++)
     {
@@ -312,7 +313,7 @@ int SoapySDR::Stream::ReadSamples(sample_complex_float* buffer, size_t num_eleme
         return res;
     }
 
-    float max_val = 4096.0f;
+    float max_val = 4095.0f;
 
     for (int i = 0; i < res; i++)
     {
@@ -334,7 +335,7 @@ int SoapySDR::Stream::ReadSamples(sample_complex_double* buffer, size_t num_elem
         return res;
     }
 
-    double max_val = 4096.0;
+    double max_val = 4095.0;
 
     for (int i = 0; i < res; i++)
     {

@@ -96,12 +96,17 @@ public:
          * Antenna API
          ******************************************************************/
         std::vector<std::string> listAntennas( const int direction, const size_t channel ) const;
+        void setAntenna( const int direction, const size_t channel, const std::string &name );
         std::string getAntenna( const int direction, const size_t channel ) const;
 
         /*******************************************************************
          * Frontend corrections API
          ******************************************************************/
         bool hasDCOffsetMode( const int direction, const size_t channel ) const { return(false); }
+        bool hasFrequencyCorrection(const int direction, const size_t channel) const;
+        void setFrequencyCorrection(const int direction, const size_t channel, const double value);
+        double getFrequencyCorrection(const int direction, const size_t channel) const;
+        bool hasIQBalance(const int direction, const size_t channel) const;
 
         /*******************************************************************
          * Gain API
