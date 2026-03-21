@@ -89,10 +89,10 @@ smi_stream_state_en caribou_smi_get_driver_streaming_state(caribou_smi_st* dev)
 /* --- helpers for “exact quarter” writes and priming ---*/  
 static void caribou_smi_boost_sched(void)
 {
-#ifdef MCL_CURRENT
-    // lock current+future pages in RAM
-    (void)mlockall(MCL_CURRENT | MCL_FUTURE);
-#endif
+    // NOTE: mlockall(MCL_CURRENT | MCL_FUTURE) was removed because it locks
+    // ALL pages of the host process (e.g. sdrpp UI, waterfall, FFT buffers)
+    // into RAM, causing OOM on memory-limited RPi4.  Instead, we mlock()
+    // only the SMI buffers after allocation (see caribou_smi_init).
 
     // switch to SCHED_FIFO if permitted
     struct sched_param sp = { .sched_priority = 50 };
@@ -695,6 +695,12 @@ int caribou_smi_init(caribou_smi_st* dev,
         caribou_smi_close (dev);
         return -1;
     }
+
+    // Lock only the SMI streaming buffers into RAM (not the entire process)
+    size_t buf_size = dev->native_batch_len + 1024;
+    mlock(dev->read_temp_buffer, buf_size);
+    mlock(dev->write_temp_buffer, buf_size);
+
     memset(&dev->debug_data, 0, sizeof(caribou_smi_debug_data_st));
 
     dev->debug_mode = caribou_smi_none;

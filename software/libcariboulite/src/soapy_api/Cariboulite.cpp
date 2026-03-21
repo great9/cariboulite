@@ -143,8 +143,6 @@ void Cariboulite::setGain(const int direction, const size_t channel, const doubl
         // manual value takes effect.  AGC can be re-enabled via
         // setGainMode(true).
         double clamped = std::max(RX_GAIN_MIN, std::min(value, RX_GAIN_MAX));
-        SoapySDR_logf(SOAPY_SDR_INFO, "setGain RX: value=%.1f clamped=%.1f gcw=%d ch=%d",
-                       value, clamped, (int)(clamped / 3.0 + 0.5), radio->type);
         cariboulite_radio_set_rx_gain_control(radio, false, clamped);
     }
     else if (direction == SOAPY_SDR_TX)

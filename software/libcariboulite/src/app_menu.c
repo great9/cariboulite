@@ -174,7 +174,8 @@ static int set_rt_and_affinity_prio(int prio, int cpu_req)
     fprintf(stderr, "[affinity] th=%lu prio=%d pinned to CPU %d/%ld\n",
             (unsigned long)pthread_self(), prio, on, ncpu);
 #endif
-    mlockall(MCL_CURRENT | MCL_FUTURE);
+    // mlockall removed — causes OOM when used inside sdrpp/large apps.
+    // SMI buffers are individually mlocked in caribou_smi_init().
     return 0;
 }
 
@@ -190,9 +191,6 @@ static inline void set_rt_and_affinity(void)
     CPU_SET(2, &set);                                     // keep this away from CPU0 IRQs
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #endif
-
-    // Avoid page faults while streaming
-    mlockall(MCL_CURRENT | MCL_FUTURE);
 }
 
 static inline void smi_idle(sys_st* sys) {
