@@ -92,70 +92,49 @@ module smi_ctrl
     // ---------------------------------------
     // RX SIDE (FPGA -> Pi)
     // ---------------------------------------
-    // CDC fix: a holding register (r_rx_holding) in sys_clk captures the
-    // FIFO output one cycle after the pull.  By the time the SOE domain
-    // latches it (2+ SOE cycles later), the register has been stable for
-    // many sys_clk periods — no metastability risk.
+    // Uses upstream's direct FIFO-to-SMI approach. The CDC holding register
+    // approach was tried but broke the data path (constant 0x8A5D output).
+    // The direct latch at int_cnt_rx==24 works because the FIFO output is
+    // stable for multiple sys_clk cycles by the time byte 3 is emitted.
     // ---------------------------------------
 
-    reg [4:0]  int_cnt_rx;              // 0,8,16,24 wrap
-    reg        r_fifo_pull, r_fifo_pull_1;
-    reg        w_fifo_pull_trigger;     // pulse on 2nd byte
+    reg [4:0] int_cnt_rx;
+    reg r_fifo_pull;
+    reg r_fifo_pull_1;
+    wire w_fifo_pull_trigger;
     reg [31:0] r_fifo_pulled_data;
 
-    wire soe_and_reset = i_rst_b & i_smi_soe_se;
-
-    // Host can read whenever FIFO not empty (unchanged)
-    assign o_smi_read_req = !i_rx_fifo_empty;
-
-    // Make a single-cycle rd_en in sys domain using the 2-FF edge detect
+    wire soe_and_reset;
+    assign soe_and_reset = i_rst_b & i_smi_soe_se;
+    assign o_smi_read_req = (!i_rx_fifo_empty);
     assign o_rx_fifo_pull = !r_fifo_pull_1 && r_fifo_pull && !i_rx_fifo_empty;
 
-    // --- sys_clk domain: holding register for FIFO output ---
-    reg [31:0] r_rx_holding;
-    reg        r_pull_done;
-
-    always @(posedge i_sys_clk or negedge i_rst_b) begin
-        if (!i_rst_b) begin
-            r_rx_holding <= 32'h0000_0000;
-            r_pull_done  <= 1'b0;
+    always @(negedge soe_and_reset)
+    begin
+        if (i_rst_b == 1'b0) begin
+            int_cnt_rx <= 5'd0;
+            r_fifo_pulled_data <= 32'h00000000;
         end else begin
-            r_pull_done <= o_rx_fifo_pull;
-            if (r_pull_done)
-                r_rx_holding <= i_rx_fifo_pulled_data;
-        end
-    end
-
-    // Byte emit on SOE falling edge; request next word while sending byte#1
-    always @(negedge soe_and_reset or negedge i_rst_b) begin
-        if (!i_rst_b) begin
-            int_cnt_rx         <= 5'd0;
-            r_fifo_pulled_data <= 32'h0000_0000;
-            o_smi_data_out     <= 8'h00;
-            w_fifo_pull_trigger<= 1'b0;
-        end else begin
-            // trigger FIFO pull on the *second* byte (int_cnt_rx==8)
+            // trigger the fifo pulling on the second byte
             w_fifo_pull_trigger <= (int_cnt_rx == 5'd8);
 
-            // drive current byte LSB->MSB order
-            o_smi_data_out <= r_fifo_pulled_data[int_cnt_rx +: 8];
+            int_cnt_rx <= int_cnt_rx + 8;
+            o_smi_data_out <= r_fifo_pulled_data[int_cnt_rx+7:int_cnt_rx];
 
-            // latch next 32b word from the *holding register* (safe CDC)
-            if (int_cnt_rx == 5'd24)
-                r_fifo_pulled_data <= r_rx_holding;
-
-            // advance byte index: 0,8,16,24, wrap by 5b overflow
-            int_cnt_rx <= int_cnt_rx + 5'd8;
+            // update the internal register as soon as we reach the fourth byte
+            if (int_cnt_rx == 5'd24) begin
+                r_fifo_pulled_data <= i_rx_fifo_pulled_data;
+            end
         end
     end
 
-    // sync the pull trigger into sys clock and form a 1-cycle pulse
-    always @(posedge i_sys_clk or negedge i_rst_b) begin
-        if (!i_rst_b) begin
-            r_fifo_pull   <= 1'b0;
+    always @(posedge i_sys_clk)
+    begin
+        if (i_rst_b == 1'b0) begin
+            r_fifo_pull <= 1'b0;
             r_fifo_pull_1 <= 1'b0;
         end else begin
-            r_fifo_pull   <= w_fifo_pull_trigger;
+            r_fifo_pull <= w_fifo_pull_trigger;
             r_fifo_pull_1 <= r_fifo_pull;
         end
     end

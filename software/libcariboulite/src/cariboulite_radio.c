@@ -26,6 +26,9 @@ static float sample_rate_middles[] = {3000e3f, 1666e3f, 1166e3f, 900e3f, 733e3f,
 static float rx_bandwidth_middles[] = {180e3f, 225e3f, 285e3f, 360e3f, 450e3f, 565e3f, 715e3f, 900e3f, 1125e3f, 1425e3f, 1800e3f};
 static float tx_bandwidth_middles[] = {90e3f, 112e3f, 142e3f, 180e3f, 225e3f, 282e3f, 357e3f, 450e3f, 562e3f, 712e3f, 900e3f};
 
+// Forward declarations for functions used in radio_init
+int cariboulite_radio_set_modem_state(cariboulite_radio_state_st* radio, cariboulite_radio_state_cmd_en state);
+
 
 //=========================================================================
 int cariboulite_radio_init(cariboulite_radio_state_st* radio, sys_st *sys, cariboulite_channel_en type)
@@ -41,12 +44,41 @@ int cariboulite_radio_init(cariboulite_radio_state_st* radio, sys_st *sys, carib
     radio->tx_loopback_anabled = false;
     radio->tx_control_with_iq_if = true;
     radio->smi_channel_id = GET_SMI_CH(type);
-    
-    // activation of the channel
-    cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, true);
-    usleep(1000);
-	cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_rx, false);
-    
+
+    // Set sensible defaults for bandwidth and sample rate so the modem
+    // doesn't start with everything at minimum (0 from memset).
+    radio->rx_bw = cariboulite_radio_rx_bw_2000KHz;
+    radio->rx_fcut = cariboulite_radio_rx_f_cut_half_fs;
+    radio->rx_fs = cariboulite_radio_rx_sample_rate_4000khz;
+    radio->tx_fcut = cariboulite_radio_rx_f_cut_half_fs;
+    radio->tx_fs = cariboulite_radio_rx_sample_rate_4000khz;
+
+    // Configure the modem's IQ interface and RX/TX bandwidth/sample-rate
+    // registers via SPI without starting the SMI DMA stream. The old code
+    // did a full activate/deactivate cycle here, but that caused rapid SMI
+    // DMA state transitions that destabilized the bus.
+    {
+        at86rf215_iq_interface_config_st modem_iq_config = {
+            .loopback_enable = false,
+            .drv_strength = at86rf215_iq_drive_current_4ma,
+            .common_mode_voltage = at86rf215_iq_common_mode_v_ieee1596_1v2,
+            .tx_control_with_iq_if = false,
+            .radio09_mode = at86rf215_iq_if_mode,
+            .radio24_mode = at86rf215_iq_if_mode,
+            .clock_skew = at86rf215_iq_clock_data_skew_3_906ns,
+        };
+        at86rf215_setup_iq_if(&sys->modem, &modem_iq_config);
+
+        // Write RX bandwidth + sample rate to hardware registers
+        cariboulite_radio_set_rx_samp_cutoff(radio, radio->rx_fs, radio->rx_fcut);
+        cariboulite_radio_set_rx_bandwidth(radio, radio->rx_bw);
+
+        // Put modem through tx_prep to lock PLL, then back to trx_off
+        cariboulite_radio_set_modem_state(radio, cariboulite_radio_state_cmd_tx_prep);
+        cariboulite_radio_wait_modem_lock(radio, 5);
+        cariboulite_radio_set_modem_state(radio, cariboulite_radio_state_cmd_trx_off);
+    }
+
     return 0;
 }
 
@@ -1113,52 +1145,68 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
     if (radio->channel_direction == cariboulite_channel_dir_rx)
     {
         at86rf215_iq_interface_config_st modem_iq_config = {
-            .loopback_enable = radio->tx_loopback_anabled,
+            .loopback_enable = 0,  // loopback disabled — normal RX
             .drv_strength = at86rf215_iq_drive_current_4ma,
             .common_mode_voltage = at86rf215_iq_common_mode_v_ieee1596_1v2,
             .tx_control_with_iq_if = false,
             .radio09_mode = at86rf215_iq_if_mode,
             .radio24_mode = at86rf215_iq_if_mode,
-            //.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
-            //.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
-            .clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02 default
-            //.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
+            .clock_skew = at86rf215_iq_clock_data_skew_3_906ns,
         };
-        
+
         // Setup the IQ stream properties
         smi_stream_state_en smi_state = smi_stream_idle;
         if (radio->smi_channel_id == caribou_smi_channel_900)
         {
-            // both radios need to be in iq_if mode
-            modem_iq_config.radio09_mode = at86rf215_iq_if_mode;
-            modem_iq_config.radio24_mode = at86rf215_iq_if_mode;
-            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
-            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
-            modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02 default
-            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
             smi_state = smi_stream_rx_channel_0;
         }
         else if (radio->smi_channel_id == caribou_smi_channel_2400)
         {
-            // both radios need to be in iq_if mode
-            modem_iq_config.radio09_mode = at86rf215_iq_if_mode;
-            modem_iq_config.radio24_mode = at86rf215_iq_if_mode;
-            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
-            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
-            modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02 default
-            //modem_iq_config.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
             smi_state = smi_stream_rx_channel_1;
         }
-        
-        at86rf215_setup_iq_if(&radio->sys->modem, &modem_iq_config);
-        
+
+        // IQ interface is already configured during radio_init — do NOT
+        // call at86rf215_setup_iq_if here. Writing CHPM can reset the modem
+        // to state 7 (RESET), killing SPI communication.
+
+        // Readback modem state and AGC to verify config
+        {
+            at86rf215_radio_state_cmd_en cur_state = at86rf215_radio_get_state(
+                &radio->sys->modem, GET_MODEM_CH(radio->type));
+            at86rf215_radio_agc_ctrl_st agc = {0};
+            at86rf215_radio_get_agc(&radio->sys->modem, GET_MODEM_CH(radio->type), &agc);
+            printf("=== Modem state: %d, AGC en=%d gain=%d att=%d avg=%d rst=%d frz=%d ===\n",
+                   cur_state, agc.enable_cmd, agc.gain_control_word, agc.att,
+                   agc.avg, agc.reset_cmd, agc.freeze_cmd);
+        }
+
+        // Set AGC to enabled with max gain to ensure signal gets through
+        cariboulite_radio_set_rx_gain_control(radio, true, 69);
+
         // configure FPGA with the correct rx channel
 		caribou_fpga_set_smi_channel (&radio->sys->fpga, radio->type == cariboulite_channel_s1g? caribou_fpga_smi_channel_0 : caribou_fpga_smi_channel_1);
         caribou_fpga_set_smi_ctrl_data_direction(&radio->sys->fpga, 1);
-        
-        // turn on the modem RX
+
+        // turn on the modem RX — PLL is locked, IQ interface configured
         cariboulite_radio_set_modem_state(radio, cariboulite_radio_state_cmd_rx);
-        
+        usleep(1000);
+
+        // Verify modem actually entered RX state
+        {
+            at86rf215_radio_state_cmd_en actual_state = at86rf215_radio_get_state(
+                &radio->sys->modem, GET_MODEM_CH(radio->type));
+            ZF_LOGI("Modem state after RX cmd: %d (expect 6=RX), PLL locked: %d",
+                    actual_state, radio->modem_pll_locked);
+
+            // Read back RXBWC and RXDFE registers
+            at86rf215_radio_set_rx_bw_samp_st bw_cfg = {0};
+            at86rf215_radio_get_rx_bandwidth_sampling(&radio->sys->modem,
+                GET_MODEM_CH(radio->type), &bw_cfg);
+            ZF_LOGI("RXBWC: bw=%d ifs=%d ifi=%d  RXDFE: fcut=%d fs=%d",
+                    bw_cfg.bw, bw_cfg.shift_if_freq, bw_cfg.inverter_sign_if,
+                    bw_cfg.fcut, bw_cfg.fs);
+        }
+
         // turn on the SMI stream
         if (caribou_smi_set_driver_streaming_state(&radio->sys->smi, smi_state) != 0)
         {

@@ -23,7 +23,7 @@ SoapySDR::KwargsList findCariboulite(const SoapySDR::Kwargs &args)
     cariboulite_lib_version_st lib_version;
     cariboulite_lib_version(&lib_version);
     
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "CaribouLite Lib v%d.%d rev %d", 
+    SoapySDR_logf(SOAPY_SDR_INFO, "CaribouLite Lib v%d.%d.%d",
                 lib_version.major_version, lib_version.minor_version, lib_version.revision);
 
 	// Detect CaribouLite board

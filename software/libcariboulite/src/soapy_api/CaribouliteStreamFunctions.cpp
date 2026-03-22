@@ -134,7 +134,10 @@ SoapySDR::Stream *Cariboulite::setupStream(const int direction,
         }
     }
 
-    cariboulite_radio_activate_channel(radio, stream->getInnerStreamType(), false);
+    // Don't activate or deactivate the channel here — just configure the stream.
+    // Activation is handled by activateStream(), deactivation by deactivateStream().
+    // Calling activate_channel(false) here caused rapid start/stop cycles that
+    // destabilized the SMI DMA path and hung the Pi.
     return stream;
 }
 
@@ -146,7 +149,12 @@ SoapySDR::Stream *Cariboulite::setupStream(const int direction,
      */
 void Cariboulite::closeStream(SoapySDR::Stream *s)
 {
-    cariboulite_radio_activate_channel(radio, s->getInnerStreamType(), false);
+    // Deactivate only if the stream is currently active
+    if (s->readerThreadRunning())
+    {
+        cariboulite_radio_activate_channel(radio, s->getInnerStreamType(), false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (s == stream)
     {
         delete stream;
@@ -195,7 +203,8 @@ int Cariboulite::activateStream(SoapySDR::Stream *stream,
 {
     stream->activateStream(1);
     int ret = cariboulite_radio_activate_channel(radio, stream->getInnerStreamType(), true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // Give the SMI DMA time to start filling the kfifo before reads begin
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return ret;
 }
 
@@ -217,7 +226,10 @@ int Cariboulite::activateStream(SoapySDR::Stream *stream,
 int Cariboulite::deactivateStream(SoapySDR::Stream *stream, const int flags, const long long timeNs)
 {
     stream->activateStream(0);
-	return cariboulite_radio_activate_channel(radio, stream->getInnerStreamType(), false);
+    int ret = cariboulite_radio_activate_channel(radio, stream->getInnerStreamType(), false);
+    // Let the SMI DMA fully stop before anything else touches the hardware
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return ret;
 }
 
 //========================================================

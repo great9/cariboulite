@@ -29,7 +29,7 @@ extern "C" {
 
 #define CARIBOULITE_MAJOR_VERSION 1
 #define CARIBOULITE_MINOR_VERSION 2
-#define CARIBOULITE_REVISION 0
+#define CARIBOULITE_REVISION 3
 
 typedef struct
 {
