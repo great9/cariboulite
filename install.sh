@@ -14,31 +14,61 @@ ERROR="0"
 [ $(id -u) = 0 ] && echo "Please do not run this script as root" && exit 100
 
 ## --------------------------------------------------------------------
-## update the git repo on develop_R1 branch to include sub-modules
+## Parse arguments
 ## --------------------------------------------------------------------
-printf "\n[  1  ] ${GREEN}CaribouLite Git Repo${NC}\n"
-git pull
-git submodule init
-git submodule update
+SKIP_DEPS=0
+SKIP_GIT=0
+SKIP_DRIVER=0
+QUICK=0
+for arg in "$@"; do
+    case "$arg" in
+        --quick|-q)  QUICK=1; SKIP_DEPS=1; SKIP_GIT=1 ;;
+        --skip-deps) SKIP_DEPS=1 ;;
+        --skip-git)  SKIP_GIT=1 ;;
+        --skip-driver) SKIP_DRIVER=1 ;;
+        --help|-h)
+            printf "Usage: $0 [options]\n"
+            printf "  --quick, -q     Skip deps, git pull, and driver rebuild (lib + FPGA only)\n"
+            printf "  --skip-deps     Skip apt-get update and dependency install\n"
+            printf "  --skip-git      Skip git pull and submodule update\n"
+            printf "  --skip-driver   Skip SMI kernel module rebuild\n"
+            exit 0 ;;
+    esac
+done
 
 ## --------------------------------------------------------------------
-## kernel module dev dependencies
+## update the git repo to include sub-modules
 ## --------------------------------------------------------------------
-printf "\n[  2  ] ${GREEN}Updating system and installing dependencies...${NC}\n"
-sudo apt-get update
-sudo apt-get -y install raspberrypi-kernel-headers # raspbian
-sudo apt-get -y install linux-headers-raspi # ubuntu
-sudo apt-get -y install module-assistant pkg-config libncurses5-dev cmake git libzmq3-dev
-sudo apt-get -y install swig avahi-daemon libavahi-client-dev python3-distutils libpython3-dev
-
-# In ubuntu we need to grant access to gpiomem
-if grep -iq "NAME=\"Ubuntu\"" /etc/os-release; then
-	sudo apt-get install rpi.gpio-common
-	echo "Adding user `whoami` to dialout, root groups"
-	sudo usermod -aG dialout,root "${USER}"
+if [ "$SKIP_GIT" = "0" ]; then
+    printf "\n[  1  ] ${GREEN}CaribouLite Git Repo${NC}\n"
+    git pull
+    git submodule init
+    git submodule update
+else
+    printf "\n[  1  ] ${CYAN}Skipping git update${NC}\n"
 fi
 
-sudo depmod -a
+## --------------------------------------------------------------------
+## kernel module dev dependencies (single apt-get update)
+## --------------------------------------------------------------------
+if [ "$SKIP_DEPS" = "0" ]; then
+    printf "\n[  2  ] ${GREEN}Updating system and installing dependencies...${NC}\n"
+    sudo apt-get update
+    sudo apt-get -y install raspberrypi-kernel-headers linux-headers-raspi \
+        module-assistant pkg-config libncurses5-dev cmake git libzmq3-dev \
+        swig avahi-daemon libavahi-client-dev python3-distutils libpython3-dev 2>/dev/null
+
+    # In ubuntu we need to grant access to gpiomem
+    if grep -iq "NAME=\"Ubuntu\"" /etc/os-release; then
+        sudo apt-get -y install rpi.gpio-common
+        echo "Adding user `whoami` to dialout, root groups"
+        sudo usermod -aG dialout,root "${USER}"
+    fi
+
+    sudo depmod -a
+else
+    printf "\n[  2  ] ${CYAN}Skipping dependency install${NC}\n"
+fi
 
 ## --------------------------------------------------------------------
 ## clone SoapySDR dependencies
@@ -117,19 +147,37 @@ make
 sudo make install
 sudo ldconfig
 
-printf "${CYAN}3. SMI kernel module & udev...${NC}\n"
-cd $ROOT_DIR/driver
-kernel_memory=$(grep "MemAvailable:" /proc/meminfo | awk '{print $2}')
-kernel_memory_mb=$((kernel_memory / 1024))
-printf "${CYAN}   Detected memory ${kernel_memory_mb} MB...${NC}\n"
-if (( kernel_memory_mb > 512 )); then
-  printf "${CYAN}   Installing with Fifo size multiplier of 6xMTU...${NC}\n"
-  ./install.sh install 6 2 3
+## --------------------------------------------------------------------
+## SMI kernel driver
+## --------------------------------------------------------------------
+if [ "$SKIP_DRIVER" = "0" ]; then
+    printf "${CYAN}3. SMI kernel module & udev...${NC}\n"
+    cd $ROOT_DIR/driver
+    kernel_memory=$(grep "MemAvailable:" /proc/meminfo | awk '{print $2}')
+    kernel_memory_mb=$((kernel_memory / 1024))
+    printf "${CYAN}   Detected memory ${kernel_memory_mb} MB...${NC}\n"
+
+    # Unload old module before installing new one
+    if lsmod | grep -q smi_stream_dev; then
+        printf "${CYAN}   Unloading old smi_stream_dev module...${NC}\n"
+        sudo rmmod smi_stream_dev 2>/dev/null
+    fi
+
+    if (( kernel_memory_mb > 512 )); then
+        printf "${CYAN}   Installing with Fifo size multiplier of 6xMTU...${NC}\n"
+        ./install.sh install 6 2 3
+    else
+        printf "${CYAN}   Installing with Fifo size multiplier of 2xMTU...${NC}\n"
+        ./install.sh install 2 2 3
+    fi
+
+    # Reload the module so we don't need a reboot
+    printf "${CYAN}   Loading new smi_stream_dev module...${NC}\n"
+    sudo modprobe smi_stream_dev
+    cd ..
 else
-  printf "${CYAN}   Installing with Fifo size multiplier of 2xMTU...${NC}\n"
-  ./install.sh install 2 2 3
+    printf "${CYAN}3. Skipping SMI kernel module${NC}\n"
 fi
-cd ..
 
 printf "${CYAN}4. Main software...${NC}\n"
 cd $ROOT_DIR
@@ -138,6 +186,15 @@ cmake $ROOT_DIR/software/libcariboulite/
 make
 sudo make install
 sudo ldconfig
+
+printf "${CYAN}5. Force FPGA reprogramming with new firmware...${NC}\n"
+if [ -x "./cariboulite_util" ]; then
+    sudo ./cariboulite_util -F
+elif command -v cariboulite_util &> /dev/null; then
+    sudo cariboulite_util -F
+else
+    printf "${RED}   cariboulite_util not found — FPGA not reprogrammed. Run manually: cariboulite_util -F${NC}\n"
+fi
 
 ## --------------------------------------------------------------------
 ## Configuration File - RPI /boot/config.txt
@@ -200,5 +257,5 @@ fi
 if [ "$ERROR" = "1" ]; then
     printf "\n[  7  ] ${RED}Installation errors occured.${NC}\n\n\n"
 else
-    printf "\n[  7  ] ${GREEN}All went well. Please reboot the system to finalize installation...${NC}\n\n\n"
+    printf "\n[  7  ] ${GREEN}All done. No reboot needed.${NC}\n\n\n"
 fi

@@ -241,8 +241,11 @@ void Cariboulite::setSampleRate( const int direction, const size_t channel, cons
 {
     cariboulite_radio_sample_rate_en fs;
     bool matched = true;
-    cariboulite_radio_f_cut_en rx_cuttof = radio->rx_fcut;
-    cariboulite_radio_f_cut_en tx_cuttof = radio->tx_fcut;
+    // Default to widest cutoff (half_fs) so the full bandwidth is usable.
+    // If the user hasn't explicitly set a cutoff, don't preserve the init
+    // default of 0 (0.25*half_fs) which severely narrows the passband.
+    cariboulite_radio_f_cut_en rx_cuttof = cariboulite_radio_rx_f_cut_half_fs;
+    cariboulite_radio_f_cut_en tx_cuttof = cariboulite_radio_rx_f_cut_half_fs;
 
     if      (std::fabs(rate - 4000000.0) < RATE_TOLERANCE)     fs = cariboulite_radio_rx_sample_rate_4000khz;
     else if (std::fabs(rate - 2000000.0) < RATE_TOLERANCE)     fs = cariboulite_radio_rx_sample_rate_2000khz;

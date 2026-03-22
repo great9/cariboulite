@@ -20,9 +20,12 @@ install() {
     local ch_offs=${3:-3}
 
     printf "${GREEN}Installation started...${NC}\n"
-    printf "\n[  1  ] ${GREEN}Updating kernel headers and needed software${NC}\n"
-    sudo apt-get update
-    sudo apt-get -y install raspberrypi-kernel-headers module-assistant pkg-config libncurses5-dev cmake git
+    printf "\n[  1  ] ${GREEN}Checking kernel headers${NC}\n"
+    # Skip apt-get update here — parent install.sh already did it
+    if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+        printf "${CYAN}   Kernel headers not found, installing...${NC}\n"
+        sudo apt-get -y install raspberrypi-kernel-headers module-assistant 2>/dev/null
+    fi
 
     printf "\n[  2  ] ${GREEN}Compiling module${NC}\n"
     if [ -d "$BUILD_DIR" ]; then
