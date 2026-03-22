@@ -200,7 +200,7 @@ module top (
       .i_config(i_config),
       .o_led0  (o_led0),
       .o_led1  (o_led1),
-      //.o_pmod  (io_pmod_out[3:0]), // disabled for sending debug info
+      //.o_pmod  (io_pmod_out[3:0]),
 
       // Analog interfaces
       .o_mixer_fm(/*o_mixer_fm*/),
@@ -247,7 +247,7 @@ module top (
   //---------------------------------------------
   // Differential clock signal (DDR)
   wire lvds_clock;  // The direct clock input
-  //wire lvds_clock_buf;  // The clock input after global buffer (improved fanout)
+  wire lvds_clock_buf;  // The clock input after global buffer (improved fanout)
 
   SB_IO #(
       .PIN_TYPE   (6'b000001),       // Input only, direct mode
@@ -258,12 +258,11 @@ module top (
       .D_IN_0(lvds_clock)
   );  // Wire out to 'lvds_clock'
 
-  //assign lvds_clock_buf = lvds_clock; // <- this is not good practice, as it uses a logic cell to buffer the clock
-  // Promote to a real global clock
-  wire lvds_clock_buf;
+  //assign lvds_clock_buf = lvds_clock;
+  // Promote to global clock buffer for better fanout and timing
   SB_GB gb_lvds (
-  .USER_SIGNAL_TO_GLOBAL_BUFFER(lvds_clock),
-  .GLOBAL_BUFFER_OUTPUT(lvds_clock_buf)
+      .USER_SIGNAL_TO_GLOBAL_BUFFER(lvds_clock),
+      .GLOBAL_BUFFER_OUTPUT(lvds_clock_buf)
   );
 
   //---------------------------------------------
@@ -302,14 +301,6 @@ module top (
   //----------------------------------------------
   // LVDS TX - I/Q Data
   //----------------------------------------------
-  // One coherent TX clock net for *everything* (no inversion).
-
-  //wire tx_clk_data = ~lvds_clock_buf;
-
-  // If the modem samples on the "other" half, flip edges by swapping Z & O below.
-  // (No need to invert tx_clk.)
-  //wire d_rise = w_lvds_tx_d0;   // data to present on posedge of tx_clk
-  //wire d_fall = w_lvds_tx_d1;   // data to present on negedge of tx_clk
 
   // Non-inverting, P-side of pair
   SB_IO #(
@@ -322,7 +313,7 @@ module top (
       .D_OUT_1(~w_lvds_tx_d0)
   );
 
-  // Inverting, N-side of pair 
+  // Inverting, N-side of pair
   SB_IO #(
       .PIN_TYPE   (6'b010000),   // {PIN_OUTPUT_DDR, PIN_OUTPUT_REGISTER }
       .IO_STANDARD("SB_LVCMOS")
@@ -335,24 +326,20 @@ module top (
 
   // Non-inverting, P-side clock
   SB_IO #(
-      .PIN_TYPE(6'b010000),
+      .PIN_TYPE(6'b011001),
       .IO_STANDARD("SB_LVCMOS")
   ) iq_tx_clk_p (
       .PACKAGE_PIN(o_iq_tx_clk_p),
-      .OUTPUT_CLK(lvds_clock_buf),  // The clock output
-      .D_OUT_0(1'b1),
-      .D_OUT_1(1'b0)  
+      .D_OUT_0(lvds_clock_buf),
   );
 
   // Inverting, N-side clock
   SB_IO #(
-      .PIN_TYPE(6'b010000),
+      .PIN_TYPE(6'b011001),
       .IO_STANDARD("SB_LVCMOS")
   ) iq_tx_clk_n (
       .PACKAGE_PIN(o_iq_tx_clk_n),
-      .OUTPUT_CLK(lvds_clock_buf),  // The clock output
-      .D_OUT_0(1'b0),
-      .D_OUT_1(1'b1)
+      .D_OUT_0(~lvds_clock_buf),
   );
 
 
@@ -416,7 +403,7 @@ module top (
 
   complex_fifo  #(
       .ADDR_WIDTH(10),   // 1024 samples
-      .DATA_WIDTH(16)  // 2x16 for I and Q
+      .DATA_WIDTH(16),  // 2x16 for I and Q 
   ) rx_fifo (
       .wr_rst_b_i(i_rst_b),
       .wr_clk_i(w_rx_fifo_write_clk),
@@ -429,7 +416,7 @@ module top (
       .rd_data_o(w_rx_fifo_pulled_data),
 
       .full_o(w_rx_fifo_full),
-      .empty_o(w_rx_fifo_empty)
+      .empty_o(w_rx_fifo_empty),
   );
   
   //=========================================================================
@@ -447,24 +434,40 @@ module top (
       .o_fifo_pull(w_tx_fifo_pull),
       .i_fifo_data(w_tx_fifo_pulled_data),
       .i_sample_gap(tx_sample_gap),
-      .i_tx_state(!w_smi_data_direction),
+      .i_tx_state(~w_smi_data_direction),
+      .i_sync_input(w_tx_sync_input_09),
       .i_debug_lb(w_debug_lb_tx),
-      .o_tx_fsm_state(w_tx_fsm_state)
-    );
+      .o_tx_state_bit(),
+      .o_sync_state_bit()
+  );
 
-    wire w_tx_fifo_full;
-    wire w_tx_fifo_empty;
-    wire w_tx_fifo_read_clk;
-    wire w_tx_fifo_push;
-    wire [31:0] w_tx_fifo_data;
-    wire w_tx_fifo_pull;
-    wire [31:0] w_tx_fifo_pulled_data;
-    wire [2:0] w_tx_fsm_state;
-    
-complex_fifo #(
+  //assign io_pmod[0] = ~lvds_clock_buf;
+  //assign io_pmod[1] = w_lvds_tx_d0;
+  //assign io_pmod[2] = w_lvds_tx_d1;
+  //assign io_pmod[0] = w_smi_write_req;
+  //assign io_pmod[1] = i_smi_swe_srw;
+  //assign io_pmod[2] = w_tx_fifo_push;
+  //assign io_pmod[3] = w_smi_tx_state[0];
+  //assign io_pmod[4] = w_smi_tx_state[1];
+  //assign io_pmod[5] = w_tx_fifo_full;
+  //assign io_pmod[6] = w_tx_fifo_empty;
+  //assign io_pmod[7] = w_tx_fifo_pull;
+
+  //assign io_pmod[7:0] = w_smi_data_input;
+  assign o_smi_write_req = i_smi_swe_srw;
+
+  wire w_tx_fifo_full;
+  wire w_tx_fifo_empty;
+  wire w_tx_fifo_read_clk;
+  wire w_tx_fifo_push;
+  wire [31:0] w_tx_fifo_data;
+  wire w_tx_fifo_pull;
+  wire [31:0] w_tx_fifo_pulled_data;
+  
+  complex_fifo #(
       .ADDR_WIDTH(10),  // 1024 samples
-      .DATA_WIDTH(16)  // 2x16 for I and Q
-) tx_fifo (
+      .DATA_WIDTH(16),  // 2x16 for I and Q 
+  ) tx_fifo (
       // smi clock is writing
       .wr_rst_b_i(i_rst_b),
       .wr_clk_i(w_clock_sys),
@@ -474,12 +477,12 @@ complex_fifo #(
 	  
       // lvds clock is pulling (reading)
       .rd_rst_b_i(i_rst_b),
-      .rd_clk_i(lvds_clock_buf),
+      .rd_clk_i(~lvds_clock_buf),
       .rd_en_i(w_tx_fifo_pull),
       .rd_data_o(w_tx_fifo_pulled_data),
-      .empty_o(w_tx_fifo_empty)
+      .empty_o(w_tx_fifo_empty),
   );
-  
+
   wire channel;
   wire w_smi_data_direction;
 
@@ -602,5 +605,9 @@ complex_fifo #(
   );
 
   assign o_smi_read_req  = (w_smi_data_direction) ? w_smi_read_req : w_smi_write_req;
+  //assign o_smi_write_req = 1'bZ;
+
+  //assign o_led0 = w_smi_data_direction;
+  //assign o_led1 = channel;
 
 endmodule  // top

@@ -43,6 +43,10 @@ _Static_assert(CARIBOU_SMI_BYTES_PER_SAMPLE == sizeof(caribou_smi_sample_complex
 #include <at86rf215.h>
 #include <rffc507x.h>
 
+#ifndef GET_MODEM_CH
+#define GET_MODEM_CH(rad_ch) ((rad_ch)==cariboulite_channel_s1g ? at86rf215_rf_channel_900mhz : at86rf215_rf_channel_2400mhz)
+#endif
+
 // include here, for testing
 #define SOURCE "firmware/top.bin"
 
@@ -79,6 +83,7 @@ typedef enum
 	app_selection_nbfm_rx,
     app_selection_nbfm_modem_selftest,
 	app_selection_monitor_modem_status,
+	app_selection_iq_cw_test,
 	app_selection_quit = 99,
 } app_selection_en;
 
@@ -106,6 +111,7 @@ static void nbfm_tx_tone(sys_st *sys);
 static void nbfm_rx(sys_st *sys);
 static void nbfm_modem_selftest(sys_st *sys);
 static void monitor_modem_status(sys_st *sys);
+static void iq_cw_test(sys_st *sys);
 
 // --- forward declarations for pthread entry points ---
 static void* dsp_producer_thread_func(void* arg);
@@ -133,6 +139,7 @@ app_menu_item_st handles[] =
 	{app_selection_nbfm_rx, nbfm_rx, "NBFM RX",},
     {app_selection_nbfm_modem_selftest, nbfm_modem_selftest, "NBFM modem Self-Test",},
 	{app_selection_monitor_modem_status, monitor_modem_status, "Monitor Modem Status",},
+	{app_selection_iq_cw_test, iq_cw_test, "IQ CW Test (IQ data path diagnostic)",},
 };
 #define NUM_HANDLES 	(int)(sizeof(handles)/sizeof(app_menu_item_st))
 
@@ -684,6 +691,8 @@ static void modem_rx_iq(sys_st *sys)
         printf("	[3] Push Debug %s\n", push_debug?"Active":"Not Active");
         printf("	[4] Pull Debug %s\n", pull_debug?"Active":"Not Active");
         printf("	[5] LFSR Debug %s\n", lfsr_debug?"Active":"Not Active");
+		printf("	[6] Set Ch1 (S1G) frequency\n");
+		printf("	[7] Set Ch2 (HiF) frequency\n");
 		printf("	[99] Return to main menu\n");
 	
 		printf("	Choice: ");
@@ -774,6 +783,52 @@ static void modem_rx_iq(sys_st *sys)
 			}
 			break;
 			
+			//--------------------------------------------
+			case 6:
+			{
+				double f;
+				printf("	Ch1 (S1G) frequency (Hz): ");
+				if (scanf("%lf", &f) == 1) {
+					bool was_active = low_active_rx;
+					if (was_active) {
+						low_active_rx = false;
+						cariboulite_radio_activate_channel(radio_low, cariboulite_channel_dir_rx, false);
+					}
+					current_freq_lo = f;
+					cariboulite_radio_set_frequency(radio_low, true, &current_freq_lo);
+					current_freq_lo = radio_low->actual_rf_frequency;
+					printf("	Actual: %.5f MHz\n", current_freq_lo / 1e6);
+					if (was_active) {
+						low_active_rx = true;
+						cariboulite_radio_activate_channel(radio_low, cariboulite_channel_dir_rx, true);
+					}
+				}
+			}
+			break;
+
+			//--------------------------------------------
+			case 7:
+			{
+				double f;
+				printf("	Ch2 (HiF) frequency (Hz): ");
+				if (scanf("%lf", &f) == 1) {
+					bool was_active = high_active_rx;
+					if (was_active) {
+						high_active_rx = false;
+						cariboulite_radio_activate_channel(radio_hi, cariboulite_channel_dir_rx, false);
+					}
+					current_freq_hi = f;
+					cariboulite_radio_set_frequency(radio_hi, true, &current_freq_hi);
+					current_freq_hi = radio_hi->actual_rf_frequency;
+					printf("	Actual: %.5f MHz\n", current_freq_hi / 1e6);
+					if (was_active) {
+						high_active_rx = true;
+						cariboulite_radio_activate_channel(radio_hi, cariboulite_channel_dir_rx, true);
+					}
+				}
+			}
+			break;
+
 			//--------------------------------------------
 			case 99:
                 low_active_rx = false;
@@ -1804,10 +1859,7 @@ int tx_pipeline_start(tx_pipeline_t* p)
     HW_LOCK();
     caribou_fpga_set_io_ctrl_mode(&p->sys->fpga, 0, caribou_fpga_io_ctrl_rfm_tx_lowpass);
     cariboulite_radio_activate_channel(p->radio, cariboulite_channel_dir_tx, true);
-    // give writer a head-start so FIFO fills a bit
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 30*1000*1000 };
-    nanosleep(&ts, NULL);
-    caribou_smi_set_driver_streaming_state(&p->sys->smi, (smi_stream_state_en)3); // TX
+    // activate_channel already starts SMI TX streaming — don't restart it
     HW_UNLOCK();
 
     __sync_synchronize();
@@ -2704,27 +2756,17 @@ static void* tx_writer_thread_func(void* arg)
     size_t quarter_samples = (native_bytes / 4) / BYTES_PER_SAMPLE;
     if (quarter_samples == 0) quarter_samples = 8192; // safe default if ioctl failed
 
-    // Arm TX state once, then just keep feeding
-    int tx_active_hw = 0;
+    // activate_channel handles SMI TX state — writer just feeds data
 
     while (1) {
         pthread_testcancel();
         if (!ctrl->active) break;
 
         if (!nbfm_tx_active) {
-            if (tx_active_hw) {
-                caribou_smi_set_driver_streaming_state(smi, (smi_stream_state_en)0);
-                tx_active_hw = 0;
-            }
             // light idle: don't busy spin
             struct timespec ts = {0, 2000000}; // 2 ms
             nanosleep(&ts, NULL);
             continue;
-        }
-
-        if (!tx_active_hw) {
-            caribou_smi_set_driver_streaming_state(smi, (smi_stream_state_en)3); // TX
-            tx_active_hw = 1;
         }
 
         // Get one frame from the producer (blocking). Size = 40k IQ16 samples.
@@ -2764,12 +2806,7 @@ static void* tx_writer_thread_func(void* arg)
         }
     }
 
-    if (tx_active_hw) {
-        caribou_smi_set_driver_streaming_state(smi, (smi_stream_state_en)0);
-        HW_LOCK();
-        cariboulite_radio_activate_channel(ctrl->radio, cariboulite_channel_dir_tx, false);
-        HW_UNLOCK();
-    }
+    // Cleanup is handled by tx_pipeline_stop / tx_pipeline_destroy
     return NULL;
 }
 
@@ -2840,6 +2877,245 @@ static inline void rx_pipeline_get_stats(rx_pipeline_t* p, rx_pipeline_stats_t* 
     rf10_fifo_get_stats(&p->rxq, &out->rxq);
 }
 
+// ========================= IQ CW TEST =========================
+// Sends constant I/Q values through the full SMI→FPGA→LVDS path.
+// If CW (DAC override) works but this doesn't, the IQ data path is broken.
+static void iq_cw_test(sys_st *sys)
+{
+    int channel = 0; // 0=S1G, 1=HiF
+    double freq_hz = 433000000.0;
+    int tx_power_dbm = 0;
+    int16_t iq_i = 20000;  // near max for 16-bit signed
+    int16_t iq_q = 0;
+    int clock_skew = 2;   // 0=1.9ns 1=2.9ns 2=3.9ns 3=4.9ns
+
+    cariboulite_radio_state_st *radio = &sys->radio_low;
+
+    printf("\n=== IQ CW Test ===\n");
+    printf("Sends constant I/Q through SMI->FPGA->LVDS (not DAC override)\n\n");
+
+    while (1) {
+        int choice;
+        radio = (channel == 0) ? &sys->radio_low : &sys->radio_high;
+
+        printf("\n  Channel: %s | Freq: %.3f MHz | Power: %d dBm | I=%d Q=%d\n",
+               channel == 0 ? "S1G" : "HiF", freq_hz / 1e6, tx_power_dbm, iq_i, iq_q);
+        printf("  [1] Start IQ CW TX\n");
+        printf("  [2] Set frequency (MHz)\n");
+        printf("  [3] Set power (-17 to +14 dBm)\n");
+        printf("  [4] Set I value (-32767 to 32767)\n");
+        printf("  [5] Set Q value (-32767 to 32767)\n");
+        printf("  [6] Switch channel (%s -> %s)\n",
+               channel == 0 ? "S1G" : "HiF", channel == 0 ? "HiF" : "S1G");
+        printf("  [7] Cycle clock skew (current: %d)\n", clock_skew);
+        printf("  [8] Force IEEE channel mode (instead of fine_low)\n");
+        printf("  [99] Return\n");
+        printf("  Choice: ");
+        if (scanf("%d", &choice) != 1) continue;
+
+        if (choice == 99) break;
+
+        switch (choice) {
+        case 2: {
+            double f;
+            printf("  Frequency (MHz): ");
+            if (scanf("%lf", &f) == 1) freq_hz = f * 1e6;
+        } break;
+        case 3: {
+            int p;
+            printf("  Power dBm: ");
+            if (scanf("%d", &p) == 1) {
+                if (p < -17) p = -17;
+                if (p > 14) p = 14;
+                tx_power_dbm = p;
+            }
+        } break;
+        case 4: {
+            int v;
+            printf("  I value: ");
+            if (scanf("%d", &v) == 1) iq_i = (int16_t)v;
+        } break;
+        case 5: {
+            int v;
+            printf("  Q value: ");
+            if (scanf("%d", &v) == 1) iq_q = (int16_t)v;
+        } break;
+        case 6:
+            channel = !channel;
+            break;
+        case 7:
+            clock_skew = (clock_skew + 1) & 0x3;
+            printf("  Clock skew set to %d (%s ns)\n", clock_skew,
+                   clock_skew == 0 ? "1.906" : clock_skew == 1 ? "2.906" :
+                   clock_skew == 2 ? "3.906" : "4.906");
+            break;
+        case 8: {
+            // Force IEEE channel mode for 433 MHz instead of fine_low.
+            // IEEE mode: CNM=0, CS=25kHz, CCF0=freq/25kHz, CN=0
+            uint32_t freq_khz = (uint32_t)(freq_hz / 1000.0);
+            uint16_t ccf0 = (uint16_t)(freq_khz / 25);
+            uint8_t buf[5] = {0};
+            buf[0] = 0x01;                    // CS = 1 (25 kHz spacing)
+            buf[1] = ccf0 & 0xFF;             // CCF0L
+            buf[2] = (ccf0 >> 8) & 0xFF;      // CCF0H
+            buf[3] = 0x00;                     // CNL = 0
+            buf[4] = 0x00;                     // CNM = 0x00 (IEEE mode)
+
+            // Write to RF09 channel registers (base 0x0104)
+            at86rf215_write_buffer(&sys->modem, 0x0104, buf, 5);
+            printf("  Forced IEEE mode: CCF0=%u (freq=%.3f MHz)\n",
+                   ccf0, ccf0 * 25.0 / 1000.0);
+
+            // Readback to verify
+            uint8_t rb[5];
+            at86rf215_read_buffer(&sys->modem, 0x0104, rb, 5);
+            printf("  Readback: CS=0x%02X CCF0=0x%02X%02X CNL=0x%02X CNM=0x%02X\n",
+                   rb[0], rb[2], rb[1], rb[3], rb[4]);
+        } break;
+        case 1: {
+            // --- Configure radio ---
+            cariboulite_radio_set_tx_power(radio, tx_power_dbm);
+            cariboulite_radio_set_frequency(radio, true, &freq_hz);
+
+            // Disable CW override (we want IQ data path)
+            cariboulite_radio_set_cw_outputs(radio, false, false);
+
+            // Force CHPM=4 for S1G (only radio09 in IQ mode) to eliminate
+            // any potential conflict with the 2.4GHz radio on the shared LVDS.
+            // Also try different clock skew values for fine_low band timing.
+            {
+                at86rf215_iq_interface_config_st iq_cfg = {
+                    .loopback_enable = 0,
+                    .drv_strength = at86rf215_iq_drive_current_4ma,
+                    .common_mode_voltage = at86rf215_iq_common_mode_v_ieee1596_1v2,
+                    .tx_control_with_iq_if = false,
+                    .radio09_mode = at86rf215_iq_if_mode,
+                    .radio24_mode = (channel == 0) ? at86rf215_baseband_mode : at86rf215_iq_if_mode,
+                    .clock_skew = (at86rf215_iq_clock_data_skew_en)clock_skew,
+                };
+                at86rf215_setup_iq_if(&sys->modem, &iq_cfg);
+                printf("  CHPM set to %d (4=radio09-only IQ, 1=both)\n",
+                       (channel == 0) ? 4 : 1);
+            }
+
+            // Activate TX via IQ path
+            cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, true);
+
+            printf("\n  === TX ON (IQ CW) — press Enter to stop ===\n");
+
+            // Read modem state, IRQs, and key TX/IQ registers
+            {
+                at86rf215_rf_channel_en ch = GET_MODEM_CH(radio->type);
+                at86rf215_radio_state_cmd_en st = at86rf215_radio_get_state(&sys->modem, ch);
+                printf("  Modem state: %d (expect 4=TX)\n", st);
+
+                // Dump key registers for diagnostics
+                uint16_t base = (ch == at86rf215_rf_channel_900mhz) ? 0x0100 : 0x0200;
+                uint8_t reg_state, reg_txdfe, reg_txcutc;
+                uint8_t reg_cs, reg_ccf0l, reg_ccf0h, reg_cnl, reg_cnm;
+                uint8_t reg_iqifc0, reg_iqifc1, reg_iqifc2;
+                uint8_t reg_irqs;
+
+                at86rf215_read_buffer(&sys->modem, base + 0x02, &reg_state, 1);  // STATE
+                at86rf215_read_buffer(&sys->modem, base + 0x12, &reg_txcutc, 1); // TXCUTC
+                at86rf215_read_buffer(&sys->modem, base + 0x13, &reg_txdfe, 1);  // TXDFE
+                at86rf215_read_buffer(&sys->modem, base + 0x04, &reg_cs, 1);     // CS
+                at86rf215_read_buffer(&sys->modem, base + 0x05, &reg_ccf0l, 1);  // CCF0L
+                at86rf215_read_buffer(&sys->modem, base + 0x06, &reg_ccf0h, 1);  // CCF0H
+                at86rf215_read_buffer(&sys->modem, base + 0x07, &reg_cnl, 1);    // CNL
+                at86rf215_read_buffer(&sys->modem, base + 0x08, &reg_cnm, 1);    // CNM
+                at86rf215_read_buffer(&sys->modem, 0x000A, &reg_iqifc0, 1);      // IQIFC0
+                at86rf215_read_buffer(&sys->modem, 0x000B, &reg_iqifc1, 1);      // IQIFC1 (CHPM)
+                at86rf215_read_buffer(&sys->modem, 0x000C, &reg_iqifc2, 1);      // IQIFC2
+                // IRQs for sub-GHz radio
+                uint16_t irqs_addr = (ch == at86rf215_rf_channel_900mhz) ? 0x0000 : 0x0001;
+                at86rf215_read_buffer(&sys->modem, irqs_addr, &reg_irqs, 1);
+
+                printf("  === AT86RF215 Register Dump ===\n");
+                printf("  STATE=0x%02X  TXDFE=0x%02X  TXCUTC=0x%02X\n",
+                       reg_state, reg_txdfe, reg_txcutc);
+                printf("  CS=0x%02X  CCF0L=0x%02X  CCF0H=0x%02X  CNL=0x%02X  CNM=0x%02X\n",
+                       reg_cs, reg_ccf0l, reg_ccf0h, reg_cnl, reg_cnm);
+                printf("  IQIFC0=0x%02X  IQIFC1=0x%02X (CHPM=%d)  IQIFC2=0x%02X\n",
+                       reg_iqifc0, reg_iqifc1, (reg_iqifc1 >> 4) & 0x07, reg_iqifc2);
+                printf("  IRQS=0x%02X (sync_fail=%d trx_err=%d)\n",
+                       reg_irqs, (reg_irqs >> 5) & 1, (reg_irqs >> 4) & 1);
+            }
+
+            // Fill a buffer with constant I/Q and stream it
+            const int BUF_SAMPLES = 8192;
+            caribou_smi_sample_complex_int16 buf[BUF_SAMPLES];
+            for (int i = 0; i < BUF_SAMPLES; i++) {
+                buf[i].i = iq_i;
+                buf[i].q = iq_q;
+            }
+
+            caribou_smi_st *smi = &sys->smi;
+            const caribou_smi_channel_en smi_ch =
+                (radio == &sys->radio_low) ? caribou_smi_channel_900 : caribou_smi_channel_2400;
+
+            // Set non-blocking for polling
+            int flags = fcntl(smi->filedesc, F_GETFL, 0);
+            if (flags != -1) fcntl(smi->filedesc, F_SETFL, flags | O_NONBLOCK);
+
+            volatile int stop = 0;
+            uint64_t total_sent = 0;
+            uint64_t t0 = mono_ns();
+
+            // Pump IQ data until stdin has input
+            struct pollfd pfds[2];
+            pfds[0].fd = smi->filedesc;
+            pfds[0].events = POLLOUT;
+            pfds[1].fd = STDIN_FILENO;
+            pfds[1].events = POLLIN;
+
+            // Consume any pending newline from scanf
+            { int c; while ((c = getchar()) != '\n' && c != EOF); }
+
+            while (!stop) {
+                int pr = poll(pfds, 2, 100);
+                if (pr < 0) break;
+
+                // Check stdin for stop
+                if (pfds[1].revents & POLLIN) {
+                    stop = 1;
+                    break;
+                }
+
+                if (pfds[0].revents & POLLOUT) {
+                    int sent = caribou_smi_write_samples(smi, smi_ch,
+                        (const caribou_smi_sample_complex_int16*)buf, BUF_SAMPLES);
+                    if (sent > 0) total_sent += sent;
+                }
+
+                // Periodically print status + key regs
+                uint64_t now = mono_ns();
+                if (now - t0 > 2000000000ULL) { // every 2s
+                    at86rf215_rf_channel_en pch = GET_MODEM_CH(radio->type);
+                    at86rf215_radio_state_cmd_en st = at86rf215_radio_get_state(&sys->modem, pch);
+                    uint16_t pb = (pch == at86rf215_rf_channel_900mhz) ? 0x0100 : 0x0200;
+                    uint8_t ptxdfe, pirqs;
+                    at86rf215_read_buffer(&sys->modem, pb + 0x13, &ptxdfe, 1);
+                    uint16_t pia = (pch == at86rf215_rf_channel_900mhz) ? 0x0000 : 0x0001;
+                    at86rf215_read_buffer(&sys->modem, pia, &pirqs, 1);
+                    printf("  [IQ CW] state=%d TXDFE=0x%02X IRQS=0x%02X(sf=%d te=%d) sent=%lu\n",
+                           st, ptxdfe, pirqs, (pirqs>>5)&1, (pirqs>>4)&1,
+                           (unsigned long)total_sent);
+                    t0 = now;
+                }
+            }
+
+            // Restore blocking mode
+            if (flags != -1) fcntl(smi->filedesc, F_SETFL, flags);
+
+            // Stop TX
+            cariboulite_radio_activate_channel(radio, cariboulite_channel_dir_tx, false);
+            printf("  === TX OFF — sent %lu samples total ===\n", (unsigned long)total_sent);
+        } break;
+        }
+    }
+}
+
 static void nbfm_tx_tone(sys_st *sys)
 {
     tx_pipeline_t tx = {0};
@@ -2853,30 +3129,86 @@ static void nbfm_tx_tone(sys_st *sys)
         .out_scale    = 4000.0f,
         .f_dev_hz     = 2500.0f,
     };
-
-    if (tx_pipeline_init(&tx, sys, &sys->radio_low, &par) != 0) {
-        fprintf(stderr, "[tx_tone] init failed\n");
-        return;
-    }
+    // 0 = S1G (radio_low), 1 = HiF (radio_high)
+    int channel = 0;
+    cariboulite_radio_state_st *radio = &sys->radio_low;
+    bool need_reinit = true;
 
     for (;;) {
+        if (need_reinit) {
+            if (tx.inited) tx_pipeline_destroy(&tx);
+            memset(&tx, 0, sizeof(tx));
+            radio = (channel == 0) ? &sys->radio_low : &sys->radio_high;
+            if (tx_pipeline_init(&tx, sys, radio, &par) != 0) {
+                fprintf(stderr, "[tx_tone] init failed\n");
+                return;
+            }
+            need_reinit = false;
+        }
+
         int choice = -1;
-        printf("TX freq: %.0f Hz  power: %d dBm\n", par.freq_hz, par.tx_power_dbm);
-        printf(" [1] Toggle NBFM TX   [99] Return\n");
-        printf(" Choice: ");
+        double new_val;
+        printf("\n  NBFM TX — %s channel\n", channel == 0 ? "S1G" : "HiF");
+        printf("  Freq: %.3f MHz  Power: %d dBm  Tone: %.0f Hz\n",
+               par.freq_hz / 1e6, par.tx_power_dbm, par.tone_hz);
+        printf("  [1] Toggle TX %s\n", tx.running ? "[ON -> OFF]" : "[OFF -> ON]");
+        printf("  [2] Set frequency (MHz)\n");
+        printf("  [3] Set power (-17 to +14 dBm)\n");
+        printf("  [4] Set tone frequency (Hz)\n");
+        printf("  [5] Switch channel (%s -> %s)\n",
+               channel == 0 ? "S1G" : "HiF",
+               channel == 0 ? "HiF" : "S1G");
+        printf("  [99] Return\n");
+        printf("  Choice: ");
         if (scanf("%d", &choice) != 1) continue;
-        if (choice == 1) {
+
+        switch (choice) {
+        case 1:
             if (!tx.running) {
                 if (tx_pipeline_start(&tx) == 0) printf("TX: ON\n");
             } else {
                 tx_pipeline_stop(&tx);
                 printf("TX: OFF\n");
             }
-        } else if (choice == 99) {
             break;
+        case 2:
+            printf("  Frequency (MHz): ");
+            if (scanf("%lf", &new_val) == 1) {
+                if (tx.running) { tx_pipeline_stop(&tx); printf("TX: OFF (freq change)\n"); }
+                par.freq_hz = new_val * 1e6;
+                need_reinit = true;
+            }
+            break;
+        case 3:
+            printf("  Power dBm (-17 to +14): ");
+            if (scanf("%lf", &new_val) == 1) {
+                int pwr = (int)new_val;
+                if (pwr < -17) pwr = -17;
+                if (pwr > 14) pwr = 14;
+                if (tx.running) { tx_pipeline_stop(&tx); printf("TX: OFF (power change)\n"); }
+                par.tx_power_dbm = pwr;
+                need_reinit = true;
+            }
+            break;
+        case 4:
+            printf("  Tone Hz: ");
+            if (scanf("%lf", &new_val) == 1) {
+                if (tx.running) { tx_pipeline_stop(&tx); printf("TX: OFF (tone change)\n"); }
+                par.tone_hz = (float)new_val;
+                need_reinit = true;
+            }
+            break;
+        case 5:
+            if (tx.running) { tx_pipeline_stop(&tx); printf("TX: OFF (channel switch)\n"); }
+            channel = !channel;
+            need_reinit = true;
+            break;
+        case 99:
+            goto done;
         }
     }
-
+done:
+    if (tx.running) tx_pipeline_stop(&tx);
     tx_pipeline_destroy(&tx);
     printf("NBFM TX tone stopped.\n");
 }

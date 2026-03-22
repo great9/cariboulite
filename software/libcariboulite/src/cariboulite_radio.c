@@ -1231,22 +1231,8 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
         };
         at86rf215_radio_setup_interrupt_mask(&radio->sys->modem, GET_MODEM_CH(radio->type), &int_mask);
         
-        at86rf215_iq_interface_config_st modem_iq_config = 
-        {
-            .loopback_enable = radio->tx_loopback_anabled,
-            //.loopback_enable = 0,
-            .drv_strength = at86rf215_iq_drive_current_4ma,
-            .common_mode_voltage = at86rf215_iq_common_mode_v_ieee1596_1v2,
-            .tx_control_with_iq_if = !radio->cw_output,
-            //.tx_control_with_iq_if = radio->tx_control_with_iq_if, // we always use the modem tx control
-            .radio09_mode = at86rf215_iq_if_mode,
-            .radio24_mode = at86rf215_iq_if_mode,
-            //.clock_skew = at86rf215_iq_clock_data_skew_1_906ns,   // 0x00
-            //.clock_skew = at86rf215_iq_clock_data_skew_2_906ns,   // 0x01
-            .clock_skew = at86rf215_iq_clock_data_skew_3_906ns,   // 0x02 default
-            //.clock_skew = at86rf215_iq_clock_data_skew_4_906ns,   // 0x03
-        };
-        at86rf215_setup_iq_if(&radio->sys->modem, &modem_iq_config);
+        // IQ interface is already configured during radio_init — do NOT
+        // call at86rf215_setup_iq_if here. Writing CHPM resets the modem.
 
         // if its an LO frequency output from the mixer - no need for modem output
         // LO applicable only to the channel with the mixer
@@ -1303,9 +1289,18 @@ int cariboulite_radio_activate_channel(cariboulite_radio_state_st* radio,
             }
             caribou_fpga_set_smi_ctrl_data_direction (&radio->sys->fpga, 0);
             
-            if(!radio->tx_control_with_iq_if)
+            // Always send explicit TX command. The tx_control_with_iq_if path
+            // (embedded TX enable in I_DATA[0]) doesn't work reliably with
+            // the current FPGA firmware.
+            cariboulite_radio_set_modem_state(radio, cariboulite_radio_state_cmd_tx);
+
+            usleep(1000);
+            // Verify modem entered TX
             {
-                cariboulite_radio_set_modem_state(radio, cariboulite_radio_state_cmd_tx);
+                at86rf215_radio_state_cmd_en actual = at86rf215_radio_get_state(
+                    &radio->sys->modem, GET_MODEM_CH(radio->type));
+                printf("=== TX activate: modem state=%d (expect 4=TX), PLL=%d ===\n",
+                       actual, radio->modem_pll_locked);
             }
         }
     }
